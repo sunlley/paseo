@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <!-- Matches the Xiaomi Pad weather widget once miuiAutoScale is off (measured, 35 px at density 2.5). -->
+  <dimen name="paseo_widget_radius">13dp</dimen>
+</resources>

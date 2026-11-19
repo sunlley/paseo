@@ -1,0 +1,32 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- KeepAliveService: holds the daemon connection while widgets are placed (Xiaomi freezes background apps). -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+  <application>
+    <service android:name="sh.paseo.widget.KeepAliveService" android:exported="false" android:foregroundServiceType="specialUse">
+      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Keeps the connection to the user's own agent daemon open so home-screen status widgets stay live." />
+    </service>
+    <!-- miuiAutoScale=false: Xiaomi launchers otherwise shrink widgets to ~0.76 on tablets
+         (dev.mi.com widget spec 11.3). It only takes effect when the widget has no scrolling list. -->
+    <receiver android:name="sh.paseo.widget.StatusWidgetReceiver" android:exported="true" android:label="@string/paseo_widget_status_label">
+      <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+      <meta-data android:name="android.appwidget.provider" android:resource="@xml/paseo_widget_status" />
+      <meta-data android:name="miuiAutoScale" android:value="false" />
+    </receiver>
+    <receiver android:name="sh.paseo.widget.FocusWidgetReceiver" android:exported="true" android:label="@string/paseo_widget_focus_label">
+      <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+      <meta-data android:name="android.appwidget.provider" android:resource="@xml/paseo_widget_focus" />
+      <meta-data android:name="miuiAutoScale" android:value="false" />
+    </receiver>
+    <receiver android:name="sh.paseo.widget.ListWidgetReceiver" android:exported="true" android:label="@string/paseo_widget_list_label">
+      <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+      <meta-data android:name="android.appwidget.provider" android:resource="@xml/paseo_widget_list" />
+      <meta-data android:name="miuiAutoScale" android:value="false" />
+    </receiver>
+    <receiver android:name="sh.paseo.widget.SummaryWidgetReceiver" android:exported="true" android:label="@string/paseo_widget_summary_label">
+      <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+      <meta-data android:name="android.appwidget.provider" android:resource="@xml/paseo_widget_summary" />
+      <meta-data android:name="miuiAutoScale" android:value="false" />
+    </receiver>
+  </application>
+</manifest>
