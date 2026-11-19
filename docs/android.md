@@ -200,6 +200,31 @@ Register this package before React Native's core package through its Expo config
 Android builds use the prebuilt `react-android` library, so patching Java under `node_modules` does
 not change the shipped scroll view. Keep this behavior in the app's compiled native module.
 
+## Home-screen widgets
+
+`modules/paseo-widget` adds four display-only Glance widgets: three 2×2 (status ring, focus, list)
+and one 4×2 summary. They never act on an agent; a row opens that agent through
+`paseo://h/<serverId>/agent/<agentId>`, anything else opens the app.
+
+- The widgets never fetch. `usePadWidgetSync` (`src/widget/`) builds a snapshot from the session
+  store and pushes it at most every 2 s, plus a 60 s heartbeat. Without a heartbeat for 5 minutes
+  the widget shows how old its data is instead of "Live".
+- The sync only runs, and only demands every host's directory, while a widget is placed. The check
+  repeats each time the app comes forward. Keep that gate: the fleet-wide directory costs every host
+  a subscription.
+- Provider subagents (Claude Task and the like) live outside the agent directory and keep
+  running after the parent's turn ends. The snapshot counts a parent as running while any of its
+  subagents run, so the sync lists every visible parent's subagents once per connection.
+- Xiaomi's SmartPower freezes a backgrounded app within seconds, which drops the daemon socket.
+  While a widget is placed, `KeepAliveService` (a `specialUse` foreground service with a minimal
+  ongoing notification) keeps the process alive. Android 12+ only allows starting it from the
+  foreground, so the app starts it when it comes forward; removing the last widget stops it.
+- Xiaomi launchers shrink widgets to about 0.76 on tablets unless the receiver declares
+  `miuiAutoScale=false`, and the flag stops working once a widget contains a scrolling list. Keep
+  the layouts fixed and list at most three rows on 4×2 and four on 2×2.
+- The layouts are sized for the Xiaomi Pad 7S Pro grid: 2×2 = 314 × 314 dp, 4×2 = 655 × 314 dp,
+  13 dp corners.
+
 ## F-Droid / source-only Android builds
 
 F-Droid builds should set `PASEO_FDROID_BUILD=1` when running Expo prebuild:

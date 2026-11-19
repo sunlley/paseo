@@ -121,7 +121,8 @@ export default {
     },
     android: {
       adaptiveIcon: {
-        backgroundColor: "#000000",
+        // The debug build installs next to the store build; an amber ground tells them apart.
+        backgroundColor: appVariant === "development" ? "#D97706" : "#000000",
         foregroundImage: "./assets/images/android-icon-foreground.png",
       },
       edgeToEdgeEnabled: true,
