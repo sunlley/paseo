@@ -107,6 +107,7 @@ import { useActiveWorktreeNewAction } from "@/hooks/use-active-worktree-new-acti
 import { useGlobalNewWorkspaceAction } from "@/hooks/use-global-new-workspace-action";
 import { useLatchedBoolean } from "@/hooks/use-latched-boolean";
 import { useFaviconStatus } from "@/hooks/use-favicon-status";
+import { usePadWidgetSync } from "@/widget/use-pad-widget-sync";
 import { useKeyboardShortcuts } from "@/keyboard/use-shortcuts";
 import { KeyboardShiftProvider } from "@/keyboard/shift";
 import { useCompactWebViewportZoomLock } from "@/hooks/use-compact-web-viewport-zoom-lock";
@@ -705,6 +706,7 @@ function ProvidersWrapper({ children }: { children: ReactNode }) {
         <OfferLinkListener />
         <HostSessionManager />
         <FaviconStatusSync />
+        <PadWidgetSync />
         {children}
       </VoiceProvider>
     </AppearanceProvider>
@@ -901,6 +903,11 @@ function AppWithSidebar({ children }: { children: ReactNode }) {
 
 function FaviconStatusSync() {
   useFaviconStatus();
+  return null;
+}
+
+function PadWidgetSync() {
+  usePadWidgetSync();
   return null;
 }
 
