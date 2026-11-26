@@ -1566,6 +1566,11 @@ export const DaemonConfigReloadRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const DaemonClientsListRequestSchema = z.object({
+  type: z.literal("daemon.clients.list.request"),
+  requestId: z.string(),
+});
+
 export const HubManagementDaemonConnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.connect.request"),
   requestId: z.string(),
@@ -3623,6 +3628,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   DaemonGetStatusRequestSchema,
   DaemonGetPairingOfferRequestSchema,
   DaemonConfigReloadRequestSchema,
+  DaemonClientsListRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
   HubManagementDaemonDisconnectRequestSchema,
@@ -4044,6 +4050,8 @@ export const ServerInfoStatusPayloadSchema = z
         daemonStatusRpc: z.boolean().optional(),
         // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
         daemonConfigReload: z.boolean().optional(),
+        // COMPAT(daemonClientsRpc): added in v0.18.0, remove gate after 2027-05-26.
+        daemonClientsRpc: z.boolean().optional(),
         // COMPAT(speechSettings): added in v0.12.0, remove gate after 2027-04-18.
         speechSettings: z.boolean().optional(),
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
@@ -5677,6 +5685,22 @@ export const DaemonConfigReloadResponseSchema = z.object({
       appliedPaths: z.array(z.string()),
       restartRequiredPaths: z.array(z.string()),
       overrideControlledPaths: z.array(z.string()),
+    })
+    .passthrough(),
+});
+
+export const DaemonClientInfoSchema = z.object({
+  clientId: z.string(),
+  clientType: z.enum(["mobile", "browser", "cli", "mcp", "hub"]),
+  appVersion: z.string().nullable(),
+});
+
+export const DaemonClientsListResponseSchema = z.object({
+  type: z.literal("daemon.clients.list.response"),
+  payload: z
+    .object({
+      requestId: z.string(),
+      clients: z.array(DaemonClientInfoSchema),
     })
     .passthrough(),
 });
@@ -7790,6 +7814,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   DaemonGetStatusResponseSchema,
   DaemonGetPairingOfferResponseSchema,
   DaemonConfigReloadResponseSchema,
+  DaemonClientsListResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,
   HubManagementDaemonDisconnectResponseSchema,
@@ -8062,6 +8087,8 @@ export type ListAvailableProvidersResponse = z.infer<typeof ListAvailableProvide
 export type DaemonGetStatusResponse = z.infer<typeof DaemonGetStatusResponseSchema>;
 export type DaemonGetPairingOfferResponse = z.infer<typeof DaemonGetPairingOfferResponseSchema>;
 export type DaemonConfigReloadResponse = z.infer<typeof DaemonConfigReloadResponseSchema>;
+export type DaemonClientInfo = z.infer<typeof DaemonClientInfoSchema>;
+export type DaemonClientsListResponse = z.infer<typeof DaemonClientsListResponseSchema>;
 export type DiagnosticsResponse = z.infer<typeof DiagnosticsResponseSchema>;
 export type GetProvidersSnapshotResponseMessage = z.infer<
   typeof GetProvidersSnapshotResponseMessageSchema

@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { startCommand, daemonRunCommand } from "./start.js";
 import { daemonStatusCommand } from "./status.js";
+import { daemonClientsCommand } from "./clients.js";
 import { daemonStopCommand } from "./stop.js";
 import { daemonRestartCommand } from "./restart.js";
 import { runSetPasswordCommand } from "./set-password.js";
@@ -16,6 +17,7 @@ export function createDaemonCommand(): Command {
     startCommand(),
     daemonRunCommand(),
     daemonStatusCommand(),
+    daemonClientsCommand(),
     daemonStopCommand(),
     daemonRestartCommand(),
     daemonReloadCommand(),
@@ -25,7 +27,13 @@ export function createDaemonCommand(): Command {
     daemon.addCommand(command);
   addJsonOption(
     addLocalDaemonOptions(
-      daemon.command("set-password").description("Save a hashed daemon password (local operation)"),
+      daemon
+        .command("set-password")
+        .description("Save a hashed daemon password (local operation)")
+        .option(
+          "--password <password>",
+          "Set non-interactively (visible in the process list; prefer the interactive prompt)",
+        ),
     ),
   ).action(withOutput(runSetPasswordCommand));
   return daemon;

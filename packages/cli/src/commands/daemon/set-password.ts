@@ -120,11 +120,15 @@ export async function runSetPasswordCommand(
   options: CommandOptions,
   _command: Command,
 ): Promise<SingleResult<SetPasswordResult>> {
-  const promptPassword =
-    typeof options.promptPassword === "function"
-      ? (options.promptPassword as PromptPassword)
-      : terminalPasswordPrompt();
-  const newPassword = await promptForPassword(promptPassword);
+  const explicitPassword = typeof options.password === "string" ? options.password : "";
+  const newPassword =
+    explicitPassword.length > 0
+      ? explicitPassword
+      : await promptForPassword(
+          typeof options.promptPassword === "function"
+            ? (options.promptPassword as PromptPassword)
+            : terminalPasswordPrompt(),
+        );
   const result = await setDaemonPasswordInConfig(newPassword, {
     home: options.daemonTarget.kind === "instance" ? options.daemonTarget.home : undefined,
   });

@@ -1,0 +1,900 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Paseo Daemon 托盘 · 设计稿 v1</title>
+    <style>
+      :root {
+        --green: #1e9e55; /* statusDotSuccess (light band) */
+        --green-dark: #34c77b;
+        --red: #e5484d;
+        --amber: #d97706;
+        --ink: #1d1d1f;
+        --ink-muted: #6e6e73;
+        --bg: #f5f5f7;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+      }
+      body {
+        font-family: -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
+        background: var(--bg);
+        color: var(--ink);
+        padding: 40px 48px 80px;
+        max-width: 1100px;
+        margin: 0 auto;
+      }
+      h1 {
+        font-size: 22px;
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+      .sub {
+        color: var(--ink-muted);
+        font-size: 13px;
+        margin-bottom: 36px;
+      }
+      h2 {
+        font-size: 15px;
+        font-weight: 600;
+        margin: 36px 0 12px;
+      }
+      .canvas {
+        background: #fff;
+        border: 1px solid #e5e5ea;
+        border-radius: 12px;
+        padding: 28px;
+      }
+
+      /* ── A. 菜单栏 ───────────────────────────── */
+      .menubar {
+        height: 26px;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        padding: 0 10px;
+        gap: 18px;
+        font-size: 13px;
+        color: #333;
+      }
+      .menubar.light {
+        background: linear-gradient(#fdfdfd, #f1f1f3);
+        border: 1px solid #dcdce0;
+      }
+      .menubar.dark {
+        background: linear-gradient(#3a3a3c, #2c2c2e);
+        border: 1px solid #000;
+        color: #f2f2f2;
+      }
+      .menubar .spacer {
+        flex: 1;
+      }
+      .menubar span.fake {
+        opacity: 0.45;
+      }
+      .tray {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 0 6px;
+        border-radius: 4px;
+        height: 20px;
+      }
+      .tray.active {
+        background: rgba(0, 0, 0, 0.12);
+      }
+      .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        display: inline-block;
+      }
+      .dot.run {
+        background: var(--green);
+        box-shadow: 0 0 0 0 rgba(30, 158, 85, 0.5);
+        animation: pulse 2s infinite;
+      }
+      @keyframes pulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(30, 158, 85, 0.45);
+        }
+        70% {
+          box-shadow: 0 0 0 5px rgba(30, 158, 85, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(30, 158, 85, 0);
+        }
+      }
+      .dot.stop {
+        background: #b0b0b5;
+      }
+      .dot.busy {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        border: 1.5px solid #b0b0b5;
+        border-top-color: transparent;
+        animation: spin 1s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .dot.err {
+        background: var(--red);
+      }
+      .menubar.dark .dot.stop {
+        background: #6e6e73;
+      }
+
+      /* ── B. 托盘菜单 ─────────────────────────── */
+      .row {
+        display: flex;
+        gap: 40px;
+        flex-wrap: wrap;
+        margin-top: 18px;
+      }
+      .menu {
+        width: 250px;
+        border-radius: 10px;
+        padding: 5px;
+        font-size: 13px;
+        box-shadow:
+          0 8px 30px rgba(0, 0, 0, 0.18),
+          0 0 0 0.5px rgba(0, 0, 0, 0.15);
+      }
+      .menu.light {
+        background: rgba(248, 248, 250, 0.92);
+        backdrop-filter: blur(20px);
+        color: #1d1d1f;
+      }
+      .menu.dark {
+        background: rgba(40, 40, 42, 0.92);
+        backdrop-filter: blur(20px);
+        color: #f2f2f2;
+        box-shadow:
+          0 8px 30px rgba(0, 0, 0, 0.5),
+          0 0 0 0.5px rgba(255, 255, 255, 0.12);
+      }
+      .menu .item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 3px 10px;
+        height: 24px;
+        border-radius: 5px;
+      }
+      .menu .item.action:hover {
+        background: var(--green);
+        color: #fff;
+      }
+      .menu.dark .item.action:hover {
+        background: #0a84ff;
+      }
+      .menu .item .glyph {
+        width: 15px;
+        text-align: center;
+        opacity: 0.75;
+        font-size: 12px;
+      }
+      .menu .status {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 1px;
+        padding: 6px 10px 7px;
+        height: auto;
+      }
+      .menu .status .l1 {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-weight: 600;
+        font-size: 13px;
+      }
+      .menu .status .l2 {
+        color: var(--ink-muted);
+        font-size: 11px;
+      }
+      .menu.dark .status .l2 {
+        color: #98989d;
+      }
+      .menu .sep {
+        height: 1px;
+        background: rgba(0, 0, 0, 0.09);
+        margin: 4px 10px;
+      }
+      .menu.dark .sep {
+        background: rgba(255, 255, 255, 0.1);
+      }
+      .menu .muted {
+        color: var(--ink-muted);
+      }
+      .menu.dark .muted {
+        color: #98989d;
+      }
+
+      /* ── C. 面板窗口 ─────────────────────────── */
+      .win {
+        width: 360px;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow:
+          0 10px 40px rgba(0, 0, 0, 0.2),
+          0 0 0 0.5px rgba(0, 0, 0, 0.15);
+      }
+      .win.light {
+        background: #fff;
+        color: var(--ink);
+      }
+      .win.dark {
+        background: #1e1e20;
+        color: #f2f2f2;
+        box-shadow:
+          0 10px 40px rgba(0, 0, 0, 0.5),
+          0 0 0 0.5px rgba(255, 255, 255, 0.14);
+      }
+      .titlebar {
+        height: 38px;
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        gap: 8px;
+        position: relative;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .tl {
+        display: flex;
+        gap: 6px;
+      }
+      .tl i {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        display: block;
+      }
+      .tl i:nth-child(1) {
+        background: #ff5f57;
+      }
+      .tl i:nth-child(2) {
+        background: #febc2e;
+      }
+      .tl i:nth-child(3) {
+        background: #28c840;
+      }
+      .titlebar .t {
+        position: absolute;
+        left: 0;
+        right: 0;
+        text-align: center;
+        pointer-events: none;
+      }
+      .win .body {
+        padding: 6px 18px 16px;
+      }
+      .hero {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 14px 0 12px;
+      }
+      .hero .dot {
+        width: 12px;
+        height: 12px;
+      }
+      .hero .txt {
+        font-size: 16px;
+        font-weight: 600;
+      }
+      .hero .meta {
+        margin-left: auto;
+        text-align: right;
+        font-size: 12px;
+        color: var(--ink-muted);
+        line-height: 1.5;
+      }
+      .win.dark .meta {
+        color: #98989d;
+      }
+      .kv {
+        display: flex;
+        font-size: 12.5px;
+        padding: 6px 0;
+        border-top: 1px solid rgba(0, 0, 0, 0.06);
+        gap: 12px;
+      }
+      .win.dark .kv {
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .kv .k {
+        width: 44px;
+        color: var(--ink-muted);
+        flex-shrink: 0;
+      }
+      .win.dark .kv .k {
+        color: #98989d;
+      }
+      .kv .v {
+        word-break: break-all;
+        user-select: text;
+      }
+      .btns {
+        display: flex;
+        gap: 8px;
+        margin-top: 14px;
+      }
+      .btn {
+        flex: 1;
+        height: 30px;
+        border-radius: 15px;
+        border: none;
+        font-size: 12.5px;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .btn.primary {
+        background: var(--green);
+        color: #fff;
+      }
+      .btn.primary:disabled {
+        background: #c9d9cf;
+      }
+      .btn.outline {
+        background: transparent;
+        color: inherit;
+        box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18);
+      }
+      .win.dark .btn.outline {
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
+      }
+      .btn.outline:disabled {
+        opacity: 0.4;
+      }
+      .hint {
+        margin-top: 12px;
+        font-size: 11px;
+        color: var(--ink-muted);
+        text-align: center;
+      }
+      .win.dark .hint {
+        color: #98989d;
+      }
+
+      /* segmented tabs */
+      .seg {
+        display: flex;
+        background: rgba(120, 120, 128, 0.16);
+        border-radius: 8px;
+        padding: 2px;
+        margin: 4px 0 14px;
+      }
+      .win.dark .seg {
+        background: rgba(120, 120, 128, 0.32);
+      }
+      .seg span {
+        flex: 1;
+        text-align: center;
+        font-size: 12px;
+        font-weight: 500;
+        padding: 4px 0;
+        border-radius: 6px;
+        color: var(--ink-muted);
+      }
+      .win.dark .seg span {
+        color: #98989d;
+      }
+      .seg span.on {
+        background: #fff;
+        color: var(--ink);
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+      }
+      .win.dark .seg span.on {
+        background: #636366;
+        color: #fff;
+      }
+
+      /* host rows */
+      .hrow {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: rgba(120, 120, 128, 0.08);
+        margin-bottom: 6px;
+      }
+      .win.dark .hrow {
+        background: rgba(120, 120, 128, 0.18);
+      }
+      .hrow .dot {
+        width: 7px;
+        height: 7px;
+        flex-shrink: 0;
+      }
+      .hrow .who {
+        min-width: 0;
+        flex: 1;
+      }
+      .hrow .name {
+        font-size: 12.5px;
+        font-weight: 500;
+      }
+      .hrow .sid {
+        font-size: 11px;
+        color: var(--ink-muted);
+        font-family: ui-monospace, monospace;
+      }
+      .win.dark .sid {
+        color: #98989d;
+      }
+      .hrow .acts {
+        display: flex;
+        gap: 4px;
+        opacity: 0;
+        transition: opacity 0.12s;
+      }
+      .hrow:hover .acts {
+        opacity: 1;
+      }
+      .mini {
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: 10px;
+        border: none;
+        background: transparent;
+        color: inherit;
+        box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.15);
+        cursor: pointer;
+      }
+      .win.dark .mini {
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
+      }
+      .mini.danger:hover {
+        background: var(--red);
+        color: #fff;
+        box-shadow: none;
+      }
+      .empty {
+        text-align: center;
+        color: var(--ink-muted);
+        font-size: 12.5px;
+        padding: 26px 0 20px;
+        line-height: 1.7;
+      }
+
+      /* password tab */
+      .field {
+        margin-bottom: 10px;
+      }
+      .field label {
+        display: block;
+        font-size: 12px;
+        font-weight: 500;
+        margin-bottom: 4px;
+      }
+      .field input {
+        width: 100%;
+        height: 30px;
+        border-radius: 8px;
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        background: rgba(120, 120, 128, 0.06);
+        padding: 0 10px;
+        font-size: 12.5px;
+        color: inherit;
+      }
+      .win.dark .field input {
+        border-color: rgba(255, 255, 255, 0.18);
+        background: rgba(120, 120, 128, 0.16);
+      }
+      .callout {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        font-size: 12px;
+        color: var(--ink);
+        background: rgba(30, 158, 85, 0.08);
+        border-radius: 8px;
+        padding: 8px 10px;
+        margin: 12px 0 0;
+        line-height: 1.5;
+      }
+      .win.dark .callout {
+        background: rgba(52, 199, 123, 0.12);
+      }
+      .callout .i {
+        color: var(--green);
+        flex-shrink: 0;
+      }
+      .pwstate {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12.5px;
+        padding: 8px 0 12px;
+      }
+
+      /* notes */
+      .notes {
+        font-size: 13px;
+        line-height: 1.8;
+        color: #444;
+      }
+      .notes b {
+        font-weight: 600;
+      }
+      .notes ul {
+        padding-left: 20px;
+      }
+      .tag {
+        display: inline-block;
+        font-size: 11px;
+        background: #eef0f2;
+        border-radius: 4px;
+        padding: 1px 6px;
+        color: #555;
+        margin-right: 6px;
+      }
+      figure {
+        margin: 0 28px 0 0;
+      }
+      figcaption {
+        font-size: 12px;
+        color: var(--ink-muted);
+        margin-bottom: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Paseo Daemon 托盘管理器 · 设计稿 v1</h1>
+    <p class="sub">
+      原生 macOS（SwiftUI MenuBarExtra）· 托盘常驻 + 状态面板 · 复用
+      <code>paseo daemon start/stop/status/restart</code>
+    </p>
+
+    <h2>A · 菜单栏图标（四种状态）</h2>
+    <div class="canvas">
+      <div class="menubar light">
+        <span class="fake">文件</span><span class="fake">编辑</span><span class="fake">显示</span>
+        <span class="spacer"></span>
+        <span class="tray active"><i class="dot run"></i></span>
+        <span class="tray"><i class="dot busy"></i></span>
+        <span class="tray"><i class="dot stop"></i></span>
+        <span class="tray"><i class="dot err"></i></span>
+        <span class="fake" style="opacity: 1">⌘</span>
+      </div>
+      <p style="font-size: 12px; color: var(--ink-muted); margin-top: 12px">
+        运行中 = 绿点（缓慢呼吸脉冲）· 执行操作 = 旋转弧 · 已停止 = 灰色实心点 · 异常 = 红点。
+        图标用 SF Symbol 渲染（circle.fill / arrow.triangle.2.circlepath / circle.slash /
+        exclamationmark.circle.fill）， 运行态以 <b>状态色填充</b>，其余态保持单色 ——
+        菜单栏里颜色只属于状态信号。
+      </p>
+    </div>
+
+    <h2>B · 托盘下拉菜单（亮 / 暗）</h2>
+    <div class="canvas row">
+      <figure>
+        <figcaption>浅色 · 运行中</figcaption>
+        <div class="menu light">
+          <div class="item status">
+            <div class="l1"><i class="dot run"></i> Paseo Daemon</div>
+            <div class="l2">运行中 · 127.0.0.1:6767 · v0.17.4</div>
+          </div>
+          <div class="sep"></div>
+          <div class="item action"><span class="glyph">⟳</span> 重启</div>
+          <div class="item action"><span class="glyph">■</span> 停止</div>
+          <div class="sep"></div>
+          <div class="item action"><span class="glyph">▤</span> 打开面板</div>
+          <div class="item action"><span class="glyph">📄</span> 打开日志</div>
+          <div class="sep"></div>
+          <div class="item action muted"><span class="glyph">⏻</span> 退出托盘</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption>深色 · 已停止</figcaption>
+        <div class="menu dark">
+          <div class="item status">
+            <div class="l1"><i class="dot stop"></i> Paseo Daemon</div>
+            <div class="l2">已停止 · /Users/sunlley/.paseo</div>
+          </div>
+          <div class="sep"></div>
+          <div class="item action"><span class="glyph">▶</span> 启动</div>
+          <div class="sep"></div>
+          <div class="item action"><span class="glyph">▤</span> 打开面板</div>
+          <div class="item action muted"><span class="glyph">📄</span> 打开日志</div>
+          <div class="sep"></div>
+          <div class="item action muted"><span class="glyph">⏻</span> 退出托盘</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption>浅色 · 执行中（操作按钮被替换为进度行）</figcaption>
+        <div class="menu light">
+          <div class="item status">
+            <div class="l1"><i class="dot busy"></i> Paseo Daemon</div>
+            <div class="l2">正在启动…（最长等待 60 秒）</div>
+          </div>
+          <div class="sep"></div>
+          <div class="item muted"><span class="glyph">⟳</span> 重启</div>
+          <div class="item muted"><span class="glyph">■</span> 停止</div>
+        </div>
+      </figure>
+    </div>
+
+    <h2>C · 面板窗口（380pt，三个标签页，亮 / 暗）</h2>
+    <div class="canvas row">
+      <figure>
+        <figcaption>状态页 · 浅色 · 运行中</figcaption>
+        <div class="win light">
+          <div class="titlebar">
+            <span class="tl"><i></i><i></i><i></i></span><span class="t">Paseo Daemon</span>
+          </div>
+          <div class="body">
+            <div class="seg"><span class="on">状态</span><span>连接</span><span>密码</span></div>
+            <div class="hero">
+              <i class="dot run"></i><span class="txt">运行中</span>
+              <div class="meta">127.0.0.1:6767<br />v0.17.4 · 启动于 22:36</div>
+            </div>
+            <div class="kv"><span class="k">PID</span><span class="v">46330</span></div>
+            <div class="kv">
+              <span class="k">Home</span><span class="v">/Users/sunlley/.paseo</span>
+            </div>
+            <div class="btns">
+              <button class="btn primary" disabled>启动</button>
+              <button class="btn outline">停止</button>
+              <button class="btn outline">重启</button>
+            </div>
+            <p class="hint">状态每 3 秒自动刷新</p>
+          </div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption>连接页 · 浅色（HostSummary 5 态状态点，悬停出操作）</figcaption>
+        <div class="win light">
+          <div class="titlebar">
+            <span class="tl"><i></i><i></i><i></i></span><span class="t">Paseo Daemon</span>
+          </div>
+          <div class="body">
+            <div class="seg"><span>状态</span><span class="on">连接</span><span>密码</span></div>
+            <div class="hrow">
+              <i class="dot run"></i>
+              <div class="who">
+                <div class="name">Mac mini 工作站</div>
+                <div class="sid">srv_aWWyQzQX · 在线</div>
+              </div>
+              <div class="acts">
+                <button class="mini">详情</button><button class="mini">禁用</button
+                ><button class="mini danger">移除</button>
+              </div>
+            </div>
+            <div class="hrow">
+              <i class="dot stop"></i>
+              <div class="who">
+                <div class="name">办公室 iMac</div>
+                <div class="sid">已禁用 · 上次在线 3 天前</div>
+              </div>
+              <div class="acts">
+                <button class="mini">详情</button><button class="mini">启用</button
+                ><button class="mini danger">移除</button>
+              </div>
+            </div>
+            <div class="hrow">
+              <i class="dot busy"></i>
+              <div class="who">
+                <div class="name">笔记本 · 出差</div>
+                <div class="sid">连接中 · 下次重试 30 秒后</div>
+              </div>
+              <div class="acts">
+                <button class="mini">详情</button><button class="mini">禁用</button
+                ><button class="mini danger">移除</button>
+              </div>
+            </div>
+            <div class="hrow">
+              <i class="dot err"></i>
+              <div class="who">
+                <div class="name">备用机</div>
+                <div class="sid">连接错误：ECONNREFUSED</div>
+              </div>
+              <div class="acts">
+                <button class="mini">详情</button><button class="mini danger">移除</button>
+              </div>
+            </div>
+            <div class="btns" style="margin-top: 8px">
+              <button class="btn outline" style="flex: 0 0 auto; padding: 0 16px">
+                ＋ 添加主机
+              </button>
+              <span style="flex: 1"></span>
+              <span style="font-size: 11px; color: var(--ink-muted); align-self: center"
+                >已保存 4 台</span
+              >
+            </div>
+          </div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption>主机详情 · 浅色（点「详情」，列表返回）</figcaption>
+        <div class="win light">
+          <div class="titlebar">
+            <span class="tl"><i></i><i></i><i></i></span><span class="t">Mac mini 工作站</span>
+          </div>
+          <div class="body">
+            <div class="hero">
+              <i class="dot run"></i><span class="txt">在线</span>
+              <div class="meta">上次在线 2 分钟前</div>
+            </div>
+            <div class="kv">
+              <span class="k">serverId</span
+              ><span class="v" style="font-family: ui-monospace, monospace">srv_aWWyQzQX8aky</span>
+            </div>
+            <div class="kv">
+              <span class="k">目标</span><span class="v">192.168.50.27:6767（直连）</span>
+            </div>
+            <div class="kv">
+              <span class="k">来源</span
+              ><span class="v">route:direct:本机 · producer 密钥已存</span>
+            </div>
+            <div class="kv">
+              <span class="k">备注</span
+              ><span class="v"
+                >出差带这台 <button class="mini" style="margin-left: 4px">编辑标签</button></span
+              >
+            </div>
+            <div class="btns">
+              <button class="btn outline">禁用</button>
+              <button
+                class="btn outline"
+                style="color: var(--red); box-shadow: inset 0 0 0 1px rgba(229, 72, 77, 0.4)"
+              >
+                移除主机
+              </button>
+            </div>
+            <p class="hint">移除后对端需要重新注册才能连回本机</p>
+          </div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption>密码页 · 深色（修改后需重启生效）</figcaption>
+        <div class="win dark">
+          <div class="titlebar">
+            <span class="tl"><i></i><i></i><i></i></span><span class="t">Paseo Daemon</span>
+          </div>
+          <div class="body">
+            <div class="seg"><span>状态</span><span>连接</span><span class="on">密码</span></div>
+            <div class="pwstate"><i class="dot run"></i> 已设置密码 · 外部客户端连接时需要认证</div>
+            <div class="field">
+              <label>新密码</label><input type="password" placeholder="至少 8 位" />
+            </div>
+            <div class="field">
+              <label>确认新密码</label><input type="password" placeholder="再输入一次" />
+            </div>
+            <div class="btns"><button class="btn primary">修改密码并重启</button></div>
+            <div class="callout">
+              <span class="i">●</span
+              ><span
+                >密码哈希后写入 config.json，不回显。修改后 daemon
+                需要重启才生效，已连接的客户端要用新密码重连。</span
+              >
+            </div>
+          </div>
+        </div>
+      </figure>
+    </div>
+    <div class="canvas row" style="margin-top: 16px">
+      <figure>
+        <figcaption>添加主机 · 浅色（粘贴对端连接串）</figcaption>
+        <div class="win light">
+          <div class="titlebar">
+            <span class="tl"><i></i><i></i><i></i></span><span class="t">添加主机</span>
+          </div>
+          <div class="body">
+            <div class="field">
+              <label>连接串（从对端 Paseo 复制）</label
+              ><input style="height: 54px" placeholder="paseo://… 或 tcp://host:port?identity=…" />
+            </div>
+            <div class="field">
+              <label>备注标签（可选）</label><input placeholder="例：办公室 iMac" />
+            </div>
+            <div class="btns">
+              <button class="btn outline">取消</button>
+              <button class="btn primary">添加</button>
+            </div>
+            <p class="hint">添加后由本 daemon 主动建立并维护连接</p>
+          </div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption>连接页 · 空状态</figcaption>
+        <div class="win light">
+          <div class="titlebar">
+            <span class="tl"><i></i><i></i><i></i></span><span class="t">Paseo Daemon</span>
+          </div>
+          <div class="body">
+            <div class="seg"><span>状态</span><span class="on">连接</span><span>密码</span></div>
+            <div class="empty">
+              还没有保存的主机<br /><span style="font-size: 11px"
+                >其他 Paseo 实例通过「连接主机」注册后显示在这里</span
+              >
+            </div>
+          </div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption>密码页 · 未设置密码（浅色）</figcaption>
+        <div class="win light">
+          <div class="titlebar">
+            <span class="tl"><i></i><i></i><i></i></span><span class="t">Paseo Daemon</span>
+          </div>
+          <div class="body">
+            <div class="seg"><span>状态</span><span>连接</span><span class="on">密码</span></div>
+            <div class="pwstate">
+              <i class="dot stop"></i> 未设置密码 · 本机以外的客户端无法连接
+            </div>
+            <div class="field">
+              <label>设置密码</label><input type="password" placeholder="至少 8 位" />
+            </div>
+            <div class="field">
+              <label>确认密码</label><input type="password" placeholder="再输入一次" />
+            </div>
+            <div class="btns"><button class="btn primary">设置密码并重启</button></div>
+            <div class="callout">
+              <span class="i">●</span
+              ><span>手机 / 其他设备直连本机时，用这个密码完成认证。局域网内建议开启。</span>
+            </div>
+          </div>
+        </div>
+      </figure>
+    </div>
+
+    <h2>D · 设计规则</h2>
+    <div class="canvas notes">
+      <ul>
+        <li>
+          <span class="tag">定位</span>只做三件事：daemon 生命周期、连接的主机、连接密码。不配置
+          agent、不开 workspace —— 那是主 app 的事。
+        </li>
+        <li>
+          <span class="tag">状态色</span>绿 / 灰 / 红 /
+          旋转弧四种，含义全局一致；菜单、面板、托盘图标三处共用同一信号，禁止别处出现第四种状态色。
+        </li>
+        <li>
+          <span class="tag">操作可见性</span>与状态互斥：运行中 → 重启/停止；停止 → 启动；执行中 →
+          按钮全部禁用 + 进度行，防止重复点击。
+        </li>
+        <li>
+          <span class="tag">破坏性</span>「停止」「重启」不弹确认 —— 目标受众是开发者，daemon
+          停止不丢数据，误触代价是重启一次。主机「移除」弹确认（删除注册信息，对端需重新配对）。
+        </li>
+        <li>
+          <span class="tag">主机数据源</span
+          ><code>paseo host ls --json</code>（HostSummary），操作走
+          <code>host enable/disable/rm/update/add</code>。行内只显示：标签 + serverId +
+          状态；详情页展示 targetDescription、来源、lastOnlineAt、error。不显示、不可导出凭据。
+        </li>
+        <li>
+          <span class="tag">主机状态点</span>五态直接映射 HostSummary.status：online=绿 ·
+          connecting=旋转弧 · offline=灰 · error=红（行内附错误码）·
+          disabled=灰（附「已禁用」）。副行文字优先展示 error.message / nextRetryAt，让状态自解释。
+        </li>
+        <li>
+          <span class="tag">添加主机</span>粘贴对端连接串即可，不做多步向导 —— 深度配对流程属于主
+          app，托盘只收连接串。
+        </li>
+        <li>
+          <span class="tag">密码数据源</span><code>daemon status</code> 的 authRequired
+          字段判断是否已设置；修改走 <code>daemon set-password</code>（哈希写
+          config.json，不回显明文），<b>必须重启 daemon 才生效</b> ——
+          界面上把这一后果写在按钮旁，不藏在文档里。
+        </li>
+        <li>
+          <span class="tag">Home</span>默认管 <code>~/.paseo</code>；启动环境变量
+          <code>PASEO_TRAY_HOME</code> 可指向其他 home（如开发目录），面板 Home
+          行如实显示。一期不做多 home 切换。
+        </li>
+        <li>
+          <span class="tag">开机自启</span
+          >不做。一期手动；需要时二期加「登录时启动」开关（LaunchAgent）。
+        </li>
+      </ul>
+    </div>
+  </body>
+</html>
