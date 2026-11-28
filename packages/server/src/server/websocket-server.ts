@@ -484,6 +484,7 @@ interface SessionConnectionBase {
   principalId: string;
   sessionKey: string;
   clientId: string;
+  clientType: WSHelloMessage["clientType"];
   appVersion: string | null;
   clientCapabilities: Record<string, unknown> | null;
   connectionLogger: pino.Logger;
@@ -1596,14 +1597,23 @@ export class VoiceAssistantWebSocketServer {
   private createSessionConnection(params: {
     ws: WebSocketLike;
     clientId: string;
+    clientType: WSHelloMessage["clientType"];
     appVersion: string | null;
     clientCapabilities: Record<string, unknown> | null;
     connectionLogger: pino.Logger;
     lifecycle: { kind: "reconnectable" } | { kind: "ephemeral-plugin"; pluginId: string };
     admission: SessionAdmission;
   }): SessionConnection {
-    const { ws, clientId, appVersion, clientCapabilities, connectionLogger, lifecycle, admission } =
-      params;
+    const {
+      ws,
+      clientId,
+      clientType,
+      appVersion,
+      clientCapabilities,
+      connectionLogger,
+      lifecycle,
+      admission,
+    } = params;
     let connection: SessionConnection | null = null;
 
     const session = this.createSocketSession({
@@ -1669,6 +1679,7 @@ export class VoiceAssistantWebSocketServer {
       hubExecutionAgents: admission.hubExecutionAgents,
       sessionKey: sessionConnectionKey(admission.principalId, clientId),
       clientId,
+      clientType,
       appVersion,
       clientCapabilities,
       connectionLogger,
@@ -1791,7 +1802,28 @@ export class VoiceAssistantWebSocketServer {
       daemonVersion: this.daemonVersion,
       daemonRuntimeConfig: this.daemonRuntimeConfig,
       getWebSocketRuntimeMetrics: () => this.lastRuntimeMetricsSnapshot,
+      listConnectedClients: () => this.listConnectedClients(),
     });
+  }
+
+  /** One entry per logical client: reconnectable sessions own multiple sockets under one key. */
+  listConnectedClients(): Array<{
+    clientId: string;
+    clientType: WSHelloMessage["clientType"];
+    appVersion: string | null;
+  }> {
+    const clients = new Map<
+      string,
+      { clientId: string; clientType: WSHelloMessage["clientType"]; appVersion: string | null }
+    >();
+    for (const connection of this.sessions.values()) {
+      clients.set(connection.sessionKey, {
+        clientId: connection.clientId,
+        clientType: connection.clientType,
+        appVersion: connection.appVersion,
+      });
+    }
+    return [...clients.values()];
   }
 
   private clearPendingConnection(ws: WebSocketLike): PendingConnection | null {
@@ -1881,6 +1913,7 @@ export class VoiceAssistantWebSocketServer {
     const connection = this.createSessionConnection({
       ws,
       clientId,
+      clientType: message.clientType,
       appVersion: message.appVersion ?? null,
       clientCapabilities: message.capabilities ?? null,
       connectionLogger,
@@ -2012,6 +2045,9 @@ export class VoiceAssistantWebSocketServer {
     existing.session.setPermissions(pending.admission!.permissions);
     existing.session.setRouted(message.routed === true);
     this.assignHostSource(existing, message, pending.admission!.principalId);
+    if (existing.clientType !== message.clientType) {
+      existing.clientType = message.clientType;
+    }
     const newAppVersion = message.appVersion ?? null;
     if (newAppVersion && newAppVersion !== existing.appVersion) {
       existing.appVersion = newAppVersion;
@@ -2131,6 +2167,8 @@ export class VoiceAssistantWebSocketServer {
         ...(this.advertiseDaemonStatusRpc ? { daemonStatusRpc: true } : {}),
         // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
         daemonConfigReload: true,
+        // COMPAT(daemonClientsRpc): added in v0.18.0, remove gate after 2027-05-26.
+        daemonClientsRpc: true,
         // COMPAT(speechSettings): added in v0.12.0, remove gate after 2027-04-18.
         speechSettings: true,
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.

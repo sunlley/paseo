@@ -640,6 +640,11 @@ export interface SessionOptions {
   daemonVersion?: string;
   daemonRuntimeConfig?: DaemonRuntimeConfig;
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
+  listConnectedClients?: () => Array<{
+    clientId: string;
+    clientType: "mobile" | "browser" | "cli" | "mcp" | "hub";
+    appVersion: string | null;
+  }>;
 }
 
 export type SessionLifecycleIntent =
@@ -964,6 +969,7 @@ export class Session {
       daemonVersion,
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
+      listConnectedClients,
     } = options;
     this.browserToolsBroker = options.browserToolsBroker;
     this.clientId = clientId;
@@ -1207,6 +1213,7 @@ export class Session {
       daemonVersion,
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
+      listConnectedClients,
       getObservationMetrics: () => ({
         Registrations: this.delivery.registrationCount,
         "Source registrations": this.delivery.sourceRegistrationCount(),
@@ -3374,6 +3381,8 @@ export class Session {
         return this.daemonSession.handleDiagnosticsRequest(msg);
       case "daemon.update.request":
         return this.daemonSession.handleUpdateRequest(msg);
+      case "daemon.clients.list.request":
+        return this.daemonSession.handleClientsListRequest(msg);
       case "set_daemon_config_request":
         return this.daemonConfigStore.patch(msg.config).then((config) => {
           return this.emit({

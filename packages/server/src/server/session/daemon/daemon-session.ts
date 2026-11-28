@@ -1,5 +1,6 @@
 import type pino from "pino";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
+import type { DaemonClientInfo } from "@getpaseo/protocol/messages";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 import { getPidLockInfo } from "../../pid-lock.js";
 import { readUnconfirmedTerminalCleanup } from "../../../terminal/terminal-worker-reaper.js";
@@ -54,6 +55,7 @@ export interface DaemonSessionOptions {
   /** Why this host's terminals cannot be served (held by a newer Paseo's worker), if so. */
   getTerminalsUnavailable?: () => string | null;
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
+  listConnectedClients?: () => Array<DaemonClientInfo>;
   getObservationMetrics?: () => Record<string, number>;
   logger: pino.Logger;
   hubRelationships?: HubRelationshipManagement;
@@ -80,6 +82,7 @@ export class DaemonSession {
   private readonly listProviderAvailability: () => Promise<ProviderAvailability[]>;
   private readonly getTerminalsUnavailable: () => string | null;
   private readonly getWebSocketRuntimeMetrics: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
+  private readonly listConnectedClients: () => Array<DaemonClientInfo>;
   private readonly getObservationMetrics: DaemonSessionOptions["getObservationMetrics"];
   private readonly logger: pino.Logger;
   private readonly selfUpdate: DaemonSelfUpdateSessionController;
@@ -99,6 +102,7 @@ export class DaemonSession {
     this.listProviderAvailability = options.listProviderAvailability;
     this.getTerminalsUnavailable = options.getTerminalsUnavailable ?? (() => null);
     this.getWebSocketRuntimeMetrics = options.getWebSocketRuntimeMetrics ?? (() => null);
+    this.listConnectedClients = options.listConnectedClients ?? (() => []);
     this.getObservationMetrics = options.getObservationMetrics;
     this.logger = options.logger;
     this.hubRelationships = options.hubRelationships ?? null;
@@ -332,5 +336,17 @@ export class DaemonSession {
     msg: Extract<SessionInboundMessage, { type: "daemon.update.request" }>,
   ): Promise<void> {
     await this.selfUpdate.dispatch(msg);
+  }
+
+  async handleClientsListRequest(
+    msg: Extract<SessionInboundMessage, { type: "daemon.clients.list.request" }>,
+  ): Promise<void> {
+    this.host.emit({
+      type: "daemon.clients.list.response",
+      payload: {
+        requestId: msg.requestId,
+        clients: [...this.listConnectedClients()],
+      },
+    });
   }
 }

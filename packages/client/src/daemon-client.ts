@@ -28,6 +28,7 @@ import {
 } from "./connection/index.js";
 import { CreationClient } from "./creation/index.js";
 import type { CreationSnapshot } from "@getpaseo/protocol/messages";
+import type { DaemonClientsListResponse } from "@getpaseo/protocol/messages";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type { z } from "zod";
 import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
@@ -6121,6 +6122,22 @@ export class DaemonClient {
         type: "daemon.get_status.request",
       },
       responseType: "daemon.get_status.response",
+      timeout: options?.timeout,
+    });
+  }
+
+  async listDaemonClients(options?: {
+    requestId?: string;
+    timeout?: number;
+  }): Promise<DaemonClientsListResponse["payload"]> {
+    if (!this.lastServerInfoMessage) throw new DaemonConnectionError("Transport not connected");
+    // COMPAT(daemonClientsRpc): added in v0.18.0, remove gate after 2027-05-26.
+    if (this.lastServerInfoMessage?.features?.daemonClientsRpc !== true) {
+      throw new Error("Update the host to list connected clients.");
+    }
+    return this.sendNamespacedCorrelatedSessionRequest({
+      requestId: options?.requestId,
+      message: { type: "daemon.clients.list.request" },
       timeout: options?.timeout,
     });
   }
