@@ -13,7 +13,9 @@ import {
 import { AgentDirectory } from "../directory.js";
 import { stat } from "node:fs/promises";
 import { z } from "zod";
+import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { ensureValidJson } from "../../json-utils.js";
+import { applyRecordPatch } from "../../record-patch.js";
 import type { Logger } from "pino";
 
 import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
@@ -145,21 +147,27 @@ export interface PaseoToolHostDependencies {
   findWorkspaceIdForCwd?: ArchiveDependencies["findWorkspaceIdForCwd"];
   worktreeManagers?: ArchiveDependencies["worktreeManagers"];
   workspaceArchiveOperations?: ArchiveDependencies["workspaceArchiveOperations"];
+  assertWorkspaceAutomationAllowed?: ArchiveDependencies["assertWorkspaceAutomationAllowed"];
   isCheckoutUntrusted?: ArchiveDependencies["isCheckoutUntrusted"];
   listActiveWorkspaces?: ArchiveDependencies["listActiveWorkspaces"];
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
-  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "listActive" | "upsert">;
+  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "listActive" | "upsert" | "update">;
   projectRegistry?: Pick<ProjectRegistry, "get" | "list">;
   createDirectoryWorkspace?: (
     cwd: string,
     title?: string | null,
     projectId?: string,
-    context?: { background?: boolean; callerWorkspaceId?: string },
+    context?: {
+      background?: boolean;
+      callerWorkspaceId?: string;
+      metadata?: Record<string, JsonValue>;
+    },
   ) => Promise<PersistedWorkspaceRecord>;
   workspaceScripts?: Pick<WorkspaceScriptsService, "list" | "launch" | "stop">;
   markWorkspaceArchiving?: ArchiveDependencies["markWorkspaceArchiving"];
   clearWorkspaceArchiving?: ArchiveDependencies["clearWorkspaceArchiving"];
+  lifecycle?: ArchiveDependencies["lifecycle"];
   createPaseoWorktree?: CreatePaseoWorktreeWorkflowFn;
   // Mints a fresh directory workspace for a cwd and returns its id.
   ensureWorkspaceForCreate?: (
@@ -207,6 +215,7 @@ const WorkspaceAutomationSummarySchema = z.object({
   kind: z.enum(["directory", "local_checkout", "worktree"]),
   title: z.string().nullable(),
   background: z.boolean().optional(),
+  metadata: z.record(z.string(), z.unknown()),
 });
 
 function toWorkspaceAutomationSummary(workspace: PersistedWorkspaceRecord) {
@@ -219,7 +228,35 @@ function toWorkspaceAutomationSummary(workspace: PersistedWorkspaceRecord) {
     title: workspace.title,
     background: workspace.background,
     parentWorkspaceId: workspace.parentWorkspaceId,
+    metadata: workspace.metadata ?? {},
   };
+}
+
+function validateWorkspaceMetadataPatch(
+  metadata: Record<string, unknown>,
+): Record<string, JsonValue> {
+  try {
+    const serialized = JSON.stringify(metadata, (_key, value) => {
+      if (typeof value === "number" && !Number.isFinite(value)) {
+        throw new PaseoToolInputError("Invalid metadata value: numbers must be finite");
+      }
+      if (
+        value === undefined ||
+        typeof value === "function" ||
+        typeof value === "symbol" ||
+        typeof value === "bigint"
+      ) {
+        throw new PaseoToolInputError("Invalid metadata value: values must be JSON-serializable");
+      }
+      return value;
+    });
+    return JSON.parse(serialized) as Record<string, JsonValue>;
+  } catch (error) {
+    if (error instanceof PaseoToolInputError) throw error;
+    throw new PaseoToolInputError(
+      `Invalid metadata value: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 type WorkspaceWorktreeMode = "branch-off" | "checkout-branch" | "checkout-pr";
@@ -410,6 +447,7 @@ interface ScheduleUpdateToolInput {
   model?: string | null;
   mode?: string | null;
   cwd?: string;
+  archiveOnFinish?: boolean;
   expiresIn?: string;
   clearExpires?: boolean;
 }
@@ -543,6 +581,7 @@ function buildScheduleUpdateInput(input: ScheduleUpdateToolInput): UpdateSchedul
     ...(providerModelPatch.model !== undefined ? { model: providerModelPatch.model } : {}),
     ...(input.mode !== undefined ? { modeId: input.mode } : {}),
     ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+    ...(input.archiveOnFinish !== undefined ? { archiveOnFinish: input.archiveOnFinish } : {}),
   };
 
   return {
@@ -724,6 +763,7 @@ function createToolCatalog(
     ["create_agent", "createAgent"],
     ["create_workspace", "createWorkspace"],
     ["list_workspaces", "listWorkspaces"],
+    ["update_workspace", "updateWorkspace"],
     ["send_agent_prompt", "sendPrompt"],
     ["get_agent_status", "getStatus"],
     ["get_agent_activity", "getActivity"],
@@ -743,6 +783,8 @@ function createToolCatalog(
       createWorkspace: (args, context) =>
         localHostOperations.get("create_workspace")!(args, context),
       listWorkspaces: (args, context) => localHostOperations.get("list_workspaces")!(args, context),
+      updateWorkspace: (args, context) =>
+        localHostOperations.get("update_workspace")!(args, context),
       sendPrompt: (args, context) => localHostOperations.get("send_agent_prompt")!(args, context),
       getStatus: (args, context) => localHostOperations.get("get_agent_status")!(args, context),
       getActivity: (args, context) => localHostOperations.get("get_agent_activity")!(args, context),
@@ -883,6 +925,21 @@ function createToolCatalog(
     };
   };
 
+  const resolveCreateAgentConfig = (
+    selectedProvider: string,
+    rawSystemPrompt?: string,
+  ): Partial<AgentSessionConfig> | undefined => {
+    const inheritedConfig = resolveInheritedProviderConfig(selectedProvider);
+    const systemPrompt = rawSystemPrompt?.trim();
+    if (!inheritedConfig && !systemPrompt) {
+      return undefined;
+    }
+    return {
+      ...inheritedConfig,
+      ...(systemPrompt ? { systemPrompt } : {}),
+    };
+  };
+
   const resolveInheritedProviderConfig = (
     selectedProvider: string,
   ): Pick<AgentSessionConfig, "providerOptions"> | undefined => {
@@ -1002,7 +1059,10 @@ function createToolCatalog(
     provider?: string;
     cwd?: string;
     isolation?: "local" | "worktree";
+    archiveOnFinish?: boolean;
   }) => {
+    const archiveOnFinish =
+      params?.archiveOnFinish === undefined ? {} : { archiveOnFinish: params.archiveOnFinish };
     const callerAgent = resolveCallerAgent();
     if (callerAgent) {
       return {
@@ -1010,6 +1070,7 @@ function createToolCatalog(
         config: {
           ...buildCallerAgentScheduleConfig(callerAgent, params),
           ...(params?.isolation ? { isolation: params.isolation } : {}),
+          ...archiveOnFinish,
         },
       };
     }
@@ -1029,6 +1090,7 @@ function createToolCatalog(
         cwd: params?.cwd?.trim() ? expandUserPath(params.cwd) : process.cwd(),
         ...(resolvedProviderModel.model ? { model: resolvedProviderModel.model } : {}),
         ...(params?.isolation ? { isolation: params.isolation } : {}),
+        ...archiveOnFinish,
       },
     };
   };
@@ -1117,6 +1179,10 @@ function createToolCatalog(
         .record(z.string(), z.unknown())
         .optional()
         .describe("Provider-specific feature values, for example { fast_mode: true } for Codex."),
+      systemPrompt: z
+        .string()
+        .optional()
+        .describe("Optional system prompt applied to the new agent."),
     })
     .strict();
   const UpdateAgentSettingsInputSchema = z
@@ -1215,7 +1281,7 @@ function createToolCatalog(
       .boolean()
       .optional()
       .describe(
-        "True creates a background agent: hidden from tabs, default lists, your subagent track and notifications. You still get its finish notification and can address it by id. Omit to inherit your own value (false without a caller); use it for helpers the user does not need to watch.",
+        "Hide the agent from the UI. Inherits your visibility when omitted. Omit unless the user asks for a specific value.",
       ),
   };
   const legacyCreateAgentPlacementFields = {
@@ -1426,7 +1492,7 @@ function createToolCatalog(
           .boolean()
           .optional()
           .describe(
-            "True hides the workspace from default lists and the sidebar while its contents remain durable and accessible; omit background to inherit your own visibility (true when you or your current workspace are background, false without a caller), and override it only when the user explicitly asks.",
+            "Hide the workspace from the UI. Inherits your visibility when omitted. Omit unless the user asks for a specific value.",
           ),
         mode: z
           .enum(["branch-off", "checkout-branch", "checkout-pr"])
@@ -1458,6 +1524,12 @@ function createToolCatalog(
           .min(1)
           .optional()
           .describe("Forge for checkout-pr mode. Defaults to the source checkout."),
+        metadata: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Optional structured metadata to attach to the workspace (top-level JSON keys; null values are omitted). Common keys include issues (array of issue URLs or refs) and body/summary/notes; any JSON-serializable custom keys are allowed.",
+          ),
       },
       outputSchema: WorkspaceAutomationSummarySchema.shape,
     },
@@ -1474,7 +1546,12 @@ function createToolCatalog(
       branch,
       prNumber,
       forge,
+      metadata,
     }) => {
+      const initialMetadata =
+        metadata !== undefined
+          ? applyRecordPatch<JsonValue>({}, validateWorkspaceMetadataPatch(metadata))
+          : undefined;
       let workspace: PersistedWorkspaceRecord;
       if (isolation === "local") {
         const cwd = resolveScopedCwd(path, { required: true });
@@ -1496,12 +1573,10 @@ function createToolCatalog(
         if (!options.createDirectoryWorkspace) {
           throw new Error("Workspace provisioning is not configured");
         }
-        workspace = await options.createDirectoryWorkspace(
-          cwd,
-          title,
-          projectId,
-          workspaceBackgroundIntent(background),
-        );
+        workspace = await options.createDirectoryWorkspace(cwd, title, projectId, {
+          ...workspaceBackgroundIntent(background),
+          ...(initialMetadata !== undefined ? { metadata: initialMetadata } : {}),
+        });
       } else {
         let cwd =
           path !== undefined || !projectId ? resolveScopedCwd(path, { required: true }) : null;
@@ -1532,6 +1607,7 @@ function createToolCatalog(
             ...(worktreeSlug ? { worktreeSlug } : {}),
             ...worktreeTarget,
             ...(title ? { title } : {}),
+            ...(initialMetadata !== undefined ? { metadata: initialMetadata } : {}),
             ...workspaceBackgroundIntent(background),
           },
         );
@@ -1643,7 +1719,10 @@ function createToolCatalog(
         notifyOnFinish = resolvedArgs.parsedArgs.notifyOnFinish ?? false;
       }
       const selectedProvider = resolveRequiredProviderModel(parsedArgs.provider).provider;
-      const inheritedConfig = resolveInheritedProviderConfig(selectedProvider);
+      const createConfig = resolveCreateAgentConfig(
+        selectedProvider,
+        parsedArgs.settings?.systemPrompt,
+      );
       const { snapshot, initialPromptStarted } = await createAgentCommand(
         {
           agentManager,
@@ -1664,7 +1743,7 @@ function createToolCatalog(
           provider: parsedArgs.provider,
           title: parsedArgs.title,
           initialPrompt: parsedArgs.initialPrompt,
-          config: inheritedConfig,
+          config: createConfig,
           cwd: resolvedArgs.cwd,
           workspaceId: resolvedArgs.workspaceId,
           thinking: parsedArgs.settings?.thinkingOptionId,
@@ -2410,6 +2489,76 @@ function createToolCatalog(
   );
 
   registerTool(
+    "update_workspace",
+    {
+      title: "Update workspace",
+      description:
+        "Update a workspace's title and/or structured metadata. Omit workspaceId to update your current workspace. Metadata is a top-level patch where keys replace their values and null removes a key. Common keys include issues (array of issue URLs or refs) and body/summary/notes; any JSON-serializable custom keys are allowed.",
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .trim()
+          .min(1)
+          .optional()
+          .describe("Workspace id to update. Omit to update your current workspace."),
+        title: z
+          .string()
+          .trim()
+          .min(1, "title cannot be empty")
+          .nullable()
+          .optional()
+          .describe(
+            "New user-visible workspace title. Pass null to clear and revert to the derived name.",
+          ),
+        metadata: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Structured metadata patch (top-level keys replace; null removes a key). Common keys include issues (array of issue URLs or refs) and body/summary/notes; any JSON-serializable custom keys are allowed.",
+          ),
+      },
+      outputSchema: WorkspaceAutomationSummarySchema.shape,
+    },
+    async ({ workspaceId: requestedWorkspaceId, title, metadata }) => {
+      if (title === undefined && metadata === undefined) {
+        throw new PaseoToolInputError("Specify at least one field to update: title or metadata");
+      }
+      if (!options.workspaceRegistry) {
+        throw new Error("Workspace registry is required to update workspaces");
+      }
+      if (!options.emitWorkspaceUpdatesForWorkspaceIds) {
+        throw new Error("Workspace update emitter is required to update workspaces");
+      }
+
+      const validatedPatch =
+        metadata !== undefined ? validateWorkspaceMetadataPatch(metadata) : undefined;
+      const workspaceId = resolveWorkspaceIdForRename(requestedWorkspaceId);
+      const updated = await options.workspaceRegistry.update(workspaceId, (existing) => {
+        if (existing.archivedAt) {
+          throw new PaseoToolInputError(`Workspace ${workspaceId} is archived`);
+        }
+        return {
+          ...existing,
+          ...(title !== undefined ? { title } : {}),
+          ...(validatedPatch !== undefined
+            ? { metadata: applyRecordPatch<JsonValue>(existing.metadata, validatedPatch) }
+            : {}),
+          updatedAt: new Date().toISOString(),
+        };
+      });
+      if (!updated) {
+        throw new PaseoToolInputError(`Workspace ${workspaceId} not found`);
+      }
+      await options.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
+
+      return {
+        content: [],
+        structuredContent: ensureValidJson(toWorkspaceAutomationSummary(updated)),
+      };
+    },
+  );
+
+  registerTool(
     "list_workspace_scripts",
     {
       title: "List workspace scripts",
@@ -2557,6 +2706,7 @@ function createToolCatalog(
       const workspaceId = await resolveTerminalWorkspaceId(resolvedCwd);
 
       const terminal = await terminalManager.createTerminal({
+        origin: { source: "agent" },
         cwd: resolvedCwd,
         workspaceId,
         ...(name?.trim() ? { name: name.trim() } : {}),
@@ -2710,13 +2860,30 @@ function createToolCatalog(
           ),
           cwd: z.string().optional(),
           isolation: z.enum(["local", "worktree"]).optional(),
+          archiveOnFinish: z
+            .boolean()
+            .optional()
+            .describe(
+              "Archive each run's workspace and agent when the run ends. Defaults to true; pass false to keep them active.",
+            ),
           maxRuns: z.number().int().positive().optional(),
           expiresIn: scheduleDurationInputSchema.optional(),
         })
         .superRefine(addScheduleCadenceIssue),
       outputSchema: ScheduleSummarySchema.shape,
     },
-    async ({ prompt, cron, timezone, name, provider, cwd, isolation, maxRuns, expiresIn }) => {
+    async ({
+      prompt,
+      cron,
+      timezone,
+      name,
+      provider,
+      cwd,
+      isolation,
+      archiveOnFinish,
+      maxRuns,
+      expiresIn,
+    }) => {
       if (!scheduleService) {
         throw new Error("Schedule service is not configured");
       }
@@ -2728,7 +2895,7 @@ function createToolCatalog(
           cron,
           ...(timezone !== undefined ? { timezone } : {}),
         }),
-        target: resolveNewAgentScheduleTarget({ provider, cwd, isolation }),
+        target: resolveNewAgentScheduleTarget({ provider, cwd, isolation, archiveOnFinish }),
         ...(name?.trim() ? { name: name.trim() } : {}),
         ...(maxRuns === undefined ? {} : { maxRuns }),
         ...(expiresAt === undefined ? {} : { expiresAt }),
@@ -3048,6 +3215,10 @@ function createToolCatalog(
             .optional()
             .describe("New mode for new-agent target (null to clear)."),
           cwd: z.string().trim().min(1).optional().describe("New cwd for new-agent target."),
+          archiveOnFinish: z
+            .boolean()
+            .optional()
+            .describe("Archive the workspace and agent of later runs when each run ends."),
           expiresIn: scheduleDurationInputSchema
             .optional()
             .describe("New relative expiry duration (for example: 1h, 2d)."),
@@ -3175,8 +3346,9 @@ function createToolCatalog(
       description:
         "List agent profiles: named provider/model/mode bundles a human configured for specific " +
         "kinds of work. Read each profile's `notes` to pick the one that fits the task you're " +
-        "delegating, then copy its `provider`, `model`, `modeId`, `thinkingOptionId`, and " +
-        "`options` into create_agent as `settings.features` (there is no `profile` parameter). " +
+        "delegating, then copy its `provider`, `model`, `modeId`, `thinkingOptionId`, " +
+        "`systemPrompt` (as `settings.systemPrompt`), and `options` (as `settings.features`) " +
+        "into create_agent (there is no `profile` parameter). " +
         "Returns an empty list if none are configured.",
       inputSchema: {},
       outputSchema: {
@@ -3427,11 +3599,19 @@ function archiveWorktreeDependencies(
   if (!options.clearWorkspaceArchiving) {
     throw new Error("Workspace archiving clearer is required to archive worktrees");
   }
+  if (!options.assertWorkspaceAutomationAllowed) {
+    throw new Error("Workspace automation gate is required to archive worktrees");
+  }
+  if (!options.isCheckoutUntrusted) {
+    throw new Error("Checkout trust lookup is required to archive worktrees");
+  }
   return {
+    lifecycle: options.lifecycle ?? null,
     paseoHome: options.paseoHome,
     paseoWorktreesBaseRoot: options.worktreesRoot,
     worktreeManagers: options.worktreeManagers,
     workspaceArchiveOperations: options.workspaceArchiveOperations,
+    assertWorkspaceAutomationAllowed: options.assertWorkspaceAutomationAllowed,
     isCheckoutUntrusted: options.isCheckoutUntrusted,
     github: options.github,
     workspaceGitService: options.workspaceGitService,

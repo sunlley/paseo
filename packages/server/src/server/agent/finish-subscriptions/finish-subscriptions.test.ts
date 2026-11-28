@@ -3,7 +3,8 @@ import { HostObservationError } from "../host-operations/index.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, describe, expect, test } from "vitest";
+import { formatAgentMessage, parseAgentMessage } from "../agent-messages/envelope.js";
 import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import { buildStoredAgentPayload } from "../agent-projections.js";
@@ -12,8 +13,11 @@ import {
   createFinishSubscriptions,
   createJsonFinishSubscriptionStore,
   type FinishObservation,
+  type FinishSubscription,
   type FinishSubscriptions,
+  type PendingWork,
 } from "./index.js";
+import type { FinishObservationResult } from "./internal/observation-buffer.js";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -25,21 +29,32 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 class Observation implements FinishObservation {
-  waits: Array<{ signal: AbortSignal; result: ReturnType<typeof deferred<WaitForFinishResult>> }> =
-    [];
+  waits: Array<{
+    signal: AbortSignal;
+    childAgentId: string;
+    result: ReturnType<typeof deferred<FinishObservationResult>>;
+  }> = [];
   permission = deferred<void>();
   opening: Promise<void> = Promise.resolve();
   openedSignals: AbortSignal[] = [];
-  async open(_record: unknown, signal: AbortSignal) {
+  /** Work that will start each child's next turn by itself, as the local host reports it. */
+  work = new Map<string, PendingWork[]>();
+  async open(record: FinishSubscription, signal: AbortSignal) {
     this.openedSignals.push(signal);
     await this.opening;
-    return { next: () => this.wait(signal), close: async () => {} };
+    return { next: () => this.wait(record.childAgentId, signal), close: async () => {} };
   }
-  async wait(signal: AbortSignal) {
+  pendingWork(record: FinishSubscription): PendingWork[] {
+    return this.work.get(record.childAgentId) ?? [];
+  }
+  waitsFor(childAgentId: string) {
+    return this.waits.filter((entry) => entry.childAgentId === childAgentId);
+  }
+  async wait(childAgentId: string, signal: AbortSignal) {
     signal.throwIfAborted();
-    const result = deferred<WaitForFinishResult>();
+    const result = deferred<FinishObservationResult>();
     signal.addEventListener("abort", () => result.reject(new Error("Stopped")), { once: true });
-    this.waits.push({ signal, result });
+    this.waits.push({ signal, childAgentId, result });
     return result.promise;
   }
   afterPermission() {
@@ -48,9 +63,18 @@ class Observation implements FinishObservation {
 }
 class Delivery implements AgentMessageDelivery {
   prompts: string[] = [];
+  /** Prompts as the recipient's provider receives them, inside their envelope. */
+  enqueued: string[] = [];
   acknowledgments: Array<ReturnType<typeof deferred<"steered">>> = [];
   enqueue(message: Parameters<AgentMessageDelivery["enqueue"]>[0]) {
     this.prompts.push(String(message.prompt));
+    this.enqueued.push(
+      formatAgentMessage({
+        id: "notification",
+        source: message.source ?? null,
+        text: String(message.prompt),
+      }),
+    );
     const acknowledgment = deferred<"steered">();
     this.acknowledgments.push(acknowledgment);
     return {
@@ -68,7 +92,12 @@ afterEach(async () => {
   for (const service of services.splice(0)) await service.close();
   await Promise.all(homes.splice(0).map((home) => rm(home, { recursive: true, force: true })));
 });
-async function scenario(directory?: string, removalFailures = 0, retryDelayMs = 1) {
+async function scenario(
+  directory?: string,
+  removalFailures = 0,
+  retryDelayMs = 1,
+  followLimitMs?: number,
+) {
   const home = directory ?? (await mkdtemp(join(tmpdir(), "finish-recovery-")));
   if (!directory) homes.push(home);
   const durableStore = createJsonFinishSubscriptionStore(home);
@@ -89,10 +118,12 @@ async function scenario(directory?: string, removalFailures = 0, retryDelayMs = 
     store,
     messages: () => delivery,
     open: observation.open.bind(observation),
+    pendingWork: observation.pendingWork.bind(observation),
     callerIsActive: async () => active,
     serverId: "origin",
     logger: createTestLogger(),
     retryDelayMs,
+    ...(followLimitMs === undefined ? {} : { followLimitMs }),
   });
   services.push(service);
   await service.start();
@@ -108,12 +139,16 @@ async function scenario(directory?: string, removalFailures = 0, retryDelayMs = 
   };
 }
 const intent = { callerAgentId: "parent", childAgentId: "child" };
-function outcome(status: "idle" | "running" | "closed" | "error" = "closed"): WaitForFinishResult {
+function outcome(
+  status: "idle" | "running" | "closed" | "error" = "closed",
+  childAgentId = "child",
+  lastMessage = "Partial work saved",
+): WaitForFinishResult {
   return {
     status: status === "error" ? "error" : "idle",
     final: buildStoredAgentPayload(
       {
-        id: "child",
+        id: childAgentId,
         provider: "codex",
         cwd: "/tmp",
         title: "Child",
@@ -125,7 +160,7 @@ function outcome(status: "idle" | "running" | "closed" | "error" = "closed"): Wa
       ["codex"],
       (_provider, own) => own ?? {},
     ),
-    lastMessage: "Partial work saved",
+    lastMessage,
     error: null,
   };
 }
@@ -485,6 +520,7 @@ test("finish recovery protects callers before durable intent has loaded", async 
     },
     messages: () => s.delivery,
     open: s.observation.open.bind(s.observation),
+    pendingWork: s.observation.pendingWork.bind(s.observation),
     callerIsActive: async () => true,
     serverId: "origin",
     logger: createTestLogger(),
@@ -520,4 +556,255 @@ test("an undispatched follow-up does not block the running child's permission no
   expect(state.delivery.prompts[0]).toContain("needs permission");
   expect(state.delivery.prompts[0]).toContain("approval");
   expect(await state.store.list()).toHaveLength(2);
+});
+
+const STILL_WORKING = "You will be notified again when it settles";
+
+describe("a child that ends its turn with work pending", () => {
+  /** Ends the child's first turn with `work` pending; the caller accepts the turn-end notice. */
+  async function following(
+    state: Awaited<ReturnType<typeof scenario>>,
+    work: PendingWork[] = ["background work"],
+  ) {
+    await state.service.register(intent);
+    await until(() => state.observation.waits.length === 1);
+    state.observation.work.set("child", work);
+    state.observation.waits[0]!.result.resolve(outcome("idle", "child", "Waiting for the build"));
+    await until(() => state.delivery.prompts.length === 1);
+    state.delivery.acknowledgments[0]!.resolve("steered");
+    await until(() => state.observation.waits.length === 2);
+  }
+  const wait = (state: Awaited<ReturnType<typeof scenario>>, child: string, index = 0) =>
+    state.observation.waitsFor(child)[index]!;
+
+  test("reports the turn end at once with its pending work, then the final finish", async () => {
+    const state = await scenario();
+    await following(state);
+    // A task such as a dev server can run for as long as the child lives.
+    expect(state.delivery.prompts[0]).toContain("Agent child (Child) finished.");
+    expect(state.delivery.prompts[0]).toContain("Waiting for the build");
+    expect(state.delivery.prompts[0]).toContain("It still has background work that will wake it.");
+    expect(state.delivery.prompts[0]).toContain(STILL_WORKING);
+    expect(parseAgentMessage(state.delivery.enqueued[0]!)).toMatchObject({
+      source: { kind: "agent-notification", event: "finished" },
+    });
+    expect(await state.store.list()).toEqual([
+      expect.objectContaining({ followingSince: expect.any(String) }),
+    ]);
+
+    state.observation.work.set("child", []);
+    state.observation.waits[1]!.result.resolve(outcome("idle", "child", "FINAL: done"));
+    await until(() => state.delivery.prompts.length === 2);
+    expect(state.delivery.prompts[1]).toContain("Agent child (Child) finished.");
+    expect(state.delivery.prompts[1]).toContain("FINAL: done");
+    expect(state.delivery.prompts[1]).not.toContain(STILL_WORKING);
+    expect(parseAgentMessage(state.delivery.enqueued[1]!)).toMatchObject({
+      source: { kind: "agent-notification", event: "finished" },
+    });
+    state.delivery.acknowledgments[1]!.resolve("steered");
+    await expect.poll(async () => (await state.store.list()).length).toBe(0);
+    // A turn a person starts after the child settled has no observer left to report it.
+    expect(state.observation.waits).toHaveLength(2);
+    expect(state.service.hasPendingForCaller("parent")).toBe(false);
+  });
+
+  test("reports each later turn that ends while work is still pending", async () => {
+    const state = await scenario();
+    await following(state, ["queued messages"]);
+    expect(state.delivery.prompts[0]).toContain("It still has queued messages.");
+    state.observation.waits[1]!.result.resolve(outcome("idle", "child", "Still waiting"));
+    await until(() => state.delivery.prompts.length === 2);
+    expect(state.delivery.prompts[1]).toContain("Still waiting");
+    expect(state.delivery.prompts[1]).toContain(STILL_WORKING);
+    state.delivery.acknowledgments[1]!.resolve("steered");
+    await until(() => state.observation.waits.length === 3);
+    state.observation.work.set("child", []);
+    state.observation.waits[2]!.result.resolve(outcome("idle", "child", "FINAL"));
+    await until(() => state.delivery.prompts.length === 3);
+    expect(state.delivery.prompts[2]).toContain("FINAL");
+    expect(state.delivery.prompts[2]).not.toContain(STILL_WORKING);
+  });
+
+  test("sends the final finish when its work drains while it is idle, without another turn", async () => {
+    const state = await scenario();
+    await following(state);
+    state.observation.work.set("child", []);
+    state.observation.waits[1]!.result.resolve({
+      ...outcome("idle", "child", "Waiting for the build"),
+      workChanged: true,
+    });
+    await until(() => state.delivery.prompts.length === 2);
+    expect(state.delivery.prompts[1]).toContain("Agent child (Child) finished.");
+    expect(state.delivery.prompts[1]).not.toContain(STILL_WORKING);
+    state.delivery.acknowledgments[1]!.resolve("steered");
+    await expect.poll(async () => (await state.store.list()).length).toBe(0);
+  });
+
+  test("a work change that leaves work pending sends nothing", async () => {
+    const state = await scenario();
+    await following(state);
+    state.observation.waits[1]!.result.resolve({
+      ...outcome("idle", "child", "Waiting for the build"),
+      workChanged: true,
+    });
+    await until(() => state.observation.waits.length === 3);
+    expect(state.delivery.prompts).toHaveLength(1);
+  });
+
+  test("ignores a work change before the child's first turn ends", async () => {
+    const state = await scenario();
+    await state.service.register(intent);
+    await until(() => state.observation.waits.length === 1);
+    state.observation.waits[0]!.result.resolve({ ...outcome("idle"), workChanged: true });
+    await until(() => state.observation.waits.length === 2);
+    expect(state.delivery.prompts).toEqual([]);
+    state.observation.waits[1]!.result.resolve(outcome("idle"));
+    await until(() => state.delivery.prompts.length === 1);
+    expect(state.delivery.prompts[0]).toContain("finished.");
+  });
+
+  test("restart while following keeps following and still reports the final finish", async () => {
+    const first = await scenario();
+    await following(first);
+    await first.service.close();
+    const restarted = await scenario(first.home);
+    await until(() => restarted.observation.waits.length === 1);
+    // A work change only counts once following, so this settles the child after a restart.
+    restarted.observation.waits[0]!.result.resolve({
+      ...outcome("idle", "child", "FINAL"),
+      workChanged: true,
+    });
+    await until(() => restarted.delivery.prompts.length === 1);
+    expect(restarted.delivery.prompts[0]).toContain("finished.");
+    expect(restarted.delivery.prompts[0]).toContain("FINAL");
+    expect(restarted.delivery.prompts[0]).not.toContain(STILL_WORKING);
+  });
+
+  test("a permission request raised after waking up reaches the parent", async () => {
+    const state = await scenario();
+    await following(state);
+    const result = outcome("running");
+    result.status = "permission";
+    result.final!.pendingPermissions = [
+      { id: "plan", name: "ExitPlanMode", input: {}, kind: "plan" } as NonNullable<
+        typeof result.final
+      >["pendingPermissions"][number],
+    ];
+    state.observation.waits[1]!.result.resolve(result);
+    await until(() => state.delivery.prompts.length === 2);
+    expect(state.delivery.prompts[1]).toContain("needs permission");
+    expect(state.delivery.prompts[1]).toContain("respond_to_permission");
+    state.delivery.acknowledgments[1]!.resolve("steered");
+    await until(() => state.observation.waits.length === 3);
+    state.observation.work.set("child", []);
+    state.observation.waits[2]!.result.resolve(outcome("idle", "child", "Plan approved and done"));
+    await until(() => state.delivery.prompts.length === 3);
+    expect(state.delivery.prompts[2]).toContain("finished.");
+    expect(state.delivery.prompts[2]).toContain("Plan approved and done");
+  });
+
+  test("a helper waiting on its own delegated agent reports now and again once it settles", async () => {
+    const state = await scenario();
+    await state.service.register({ callerAgentId: "parent", childAgentId: "helper" });
+    await state.service.register({ callerAgentId: "helper", childAgentId: "sub" });
+    await until(() => state.observation.waits.length === 2);
+
+    wait(state, "helper").result.resolve(outcome("idle", "helper", "Waiting for my helper"));
+    await until(() => state.delivery.prompts.length === 1);
+    expect(state.delivery.prompts[0]).toContain("Agent helper (Child) finished.");
+    expect(state.delivery.prompts[0]).toContain("It still has agents it is waiting on.");
+    state.delivery.acknowledgments[0]!.resolve("steered");
+
+    wait(state, "sub").result.resolve(outcome("idle", "sub", "Sub result"));
+    await until(() => state.delivery.prompts.length === 2);
+    expect(state.delivery.prompts[1]).toContain("Agent sub (Child) finished.");
+    state.delivery.acknowledgments[1]!.resolve("steered");
+    await until(() => !state.service.hasPendingForCaller("helper"));
+
+    await until(() => state.observation.waitsFor("helper").length === 2);
+    wait(state, "helper", 1).result.resolve(outcome("idle", "helper", "Helper final"));
+    await until(() => state.delivery.prompts.length === 3);
+    expect(state.delivery.prompts[2]).toContain("Agent helper (Child) finished.");
+    expect(state.delivery.prompts[2]).toContain("Helper final");
+    expect(state.delivery.prompts[2]).not.toContain(STILL_WORKING);
+  });
+
+  test("a followed helper settles when its last delegation ends without reporting to it", async () => {
+    const state = await scenario();
+    await state.service.register({ callerAgentId: "parent", childAgentId: "helper" });
+    await state.service.register({
+      callerAgentId: "helper",
+      childAgentId: "sub",
+      requireParentOwnership: true,
+    });
+    await until(() => state.observation.waits.length === 2);
+
+    wait(state, "helper").result.resolve(outcome("idle", "helper", "Waiting for my helper"));
+    await until(() => state.delivery.prompts.length === 1);
+    state.delivery.acknowledgments[0]!.resolve("steered");
+    await until(() => state.observation.waitsFor("helper").length === 2);
+
+    // The sub was detached from the helper, so its result is not reported to the helper.
+    wait(state, "sub").result.resolve(outcome("idle", "sub", "Sub result"));
+    await until(() => state.delivery.prompts.length === 2);
+    expect(state.delivery.prompts[1]).toContain("Agent helper (Child) finished.");
+    expect(state.delivery.prompts[1]).toContain("Waiting for my helper");
+    expect(state.delivery.prompts[1]).not.toContain(STILL_WORKING);
+    expect(state.delivery.prompts.join("\n")).not.toContain("Sub result");
+  });
+
+  test("agents that only wait on each other settle and both callers hear finished", async () => {
+    const state = await scenario();
+    await state.service.register({ callerAgentId: "parent", childAgentId: "helper" });
+    await until(() => state.observation.waits.length === 1);
+    // The helper asks its parent a question and waits for the answer.
+    await state.service.register({ callerAgentId: "helper", childAgentId: "parent" });
+    await until(() => state.observation.waits.length === 2);
+
+    state.observation.work.set("parent", ["turn"]);
+    wait(state, "helper").result.resolve(outcome("idle", "helper", "Asked my parent"));
+    await until(() => state.delivery.prompts.length === 1);
+    expect(state.delivery.prompts[0]).toContain("Agent helper (Child) finished.");
+    expect(state.delivery.prompts[0]).toContain(STILL_WORKING);
+    state.delivery.acknowledgments[0]!.resolve("steered");
+
+    // The parent answers. It waits on the helper, and the helper waits only on it.
+    state.observation.work.set("parent", []);
+    wait(state, "parent").result.resolve(outcome("idle", "parent", "The answer"));
+    await until(() => state.delivery.prompts.length === 2);
+    expect(state.delivery.prompts[1]).toContain("Agent parent (Child) finished.");
+    expect(state.delivery.prompts[1]).toContain("The answer");
+    expect(state.delivery.prompts[1]).not.toContain(STILL_WORKING);
+    state.delivery.acknowledgments[1]!.resolve("steered");
+    await until(() => !state.service.hasPendingForCaller("helper"));
+
+    await until(() => state.observation.waitsFor("helper").length === 2);
+    wait(state, "helper", 1).result.resolve(outcome("idle", "helper", "Helper final"));
+    await until(() => state.delivery.prompts.length === 3);
+    expect(state.delivery.prompts[2]).toContain("Agent helper (Child) finished.");
+    expect(state.delivery.prompts[2]).toContain("Helper final");
+    expect(state.delivery.prompts[2]).not.toContain(STILL_WORKING);
+  });
+
+  test("at the follow limit the caller gets a final finished with the child's last reply", async () => {
+    const state = await scenario(undefined, 0, 1, 50);
+    await following(state);
+    await until(() => state.delivery.prompts.length === 2);
+    expect(state.delivery.prompts[1]).toContain("Agent child (Child) finished.");
+    expect(state.delivery.prompts[1]).toContain("Waiting for the build");
+    expect(state.delivery.prompts[1]).toContain("Paseo stopped following it");
+    expect(state.delivery.prompts[1]).not.toContain(STILL_WORKING);
+    state.delivery.acknowledgments[1]!.resolve("steered");
+    await expect.poll(async () => (await state.store.list()).length).toBe(0);
+  });
+
+  test("errors while following end the subscription as they do today", async () => {
+    const state = await scenario();
+    await following(state);
+    state.observation.waits[1]!.result.resolve(outcome("error"));
+    await until(() => state.delivery.prompts.length === 2);
+    expect(state.delivery.prompts[1]).toContain("errored");
+    state.delivery.acknowledgments[1]!.resolve("steered");
+    await expect.poll(async () => (await state.store.list()).length).toBe(0);
+  });
 });

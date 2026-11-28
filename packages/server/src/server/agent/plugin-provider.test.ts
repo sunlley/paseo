@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile as readFsFile, rm, writeFile as writeFsFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentStorage } from "./agent-storage.js";
@@ -8,13 +8,14 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { runAcpProvider, type AcpStreamMessage } from "@getpaseo/plugin/server/acp";
 import type {
+  ProviderCapability,
   ProviderConnection,
   ProviderLaunch,
   ProviderEvent,
   ProviderInput,
   ProviderRegistration,
 } from "@getpaseo/plugin/server/provider";
-import { sendPreparedPromptToAgent } from "./agent-prompt.js";
+import { sendPreparedPromptToAgent, startAgentRun } from "./agent-prompt.js";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { describe, expect, test } from "vitest";
 import { createTestLogger } from "../../test-utils/test-logger.js";
@@ -24,6 +25,8 @@ import { AgentManager } from "./agent-manager.js";
 import { buildProviderRegistry } from "./provider-registry.js";
 import { ProviderOverrideSchema } from "@getpaseo/protocol/provider-config";
 import { PluginAgentClientRegistry } from "./plugin-provider.js";
+import { ToolPolicyUnsupportedError } from "./provider-options.js";
+import { runProviderRefreshWithDeadline } from "./provider-refresh-deadline.js";
 import {
   isStaleProviderSessionError,
   StaleProviderSessionError,
@@ -313,6 +316,7 @@ function createRewindProviderHarness(
     reuseAnswerId?: boolean;
     forkOnRevert?: boolean;
     handleInput?: ProviderHarnessOptions["handleInput"];
+    extraCapabilities?: ProviderCapability[];
   } = {},
 ) {
   const nativeMessages: string[] = [];
@@ -324,6 +328,7 @@ function createRewindProviderHarness(
       "session.revert.conversation",
       "session.revert.files",
       "session.revert.both",
+      ...(options.extraCapabilities ?? []),
     ],
     async handleInput(input, emit) {
       if (await options.handleInput?.(input, emit)) return true;
@@ -2623,6 +2628,140 @@ describe("pending provider responses", () => {
       );
     },
   );
+
+  test.each([
+    { offered: true, cancels: true },
+    { offered: false, cancels: false },
+  ])(
+    "tells the provider to cancel an abandoned catalogue request: offered $offered",
+    async ({ offered, cancels }) => {
+      const controller = new AbortController();
+      const inputs: ProviderInput[] = [];
+      await withObservedProvider(
+        {
+          capabilities: offered ? [...CAPABILITIES, "request.cancel"] : CAPABILITIES,
+          async handleInput(input) {
+            inputs.push(input);
+            if (input.type === "catalog") setImmediate(() => controller.abort(new Error("Late")));
+            return input.type === "catalog" || input.type === "request.cancel";
+          },
+        },
+        async (client) => {
+          await expect(
+            client.fetchCatalog({ scope: "global" }, { signal: controller.signal }),
+          ).rejects.toThrow("Late");
+          await nextTurn();
+        },
+      );
+      const catalog = inputs.find((input) => input.type === "catalog");
+      expect(inputs.filter((input) => input.type === "request.cancel")).toEqual(
+        cancels && catalog && "requestId" in catalog
+          ? [{ type: "request.cancel", requestId: catalog.requestId }]
+          : [],
+      );
+    },
+  );
+});
+
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function readIfPresent(file: string): Promise<string> {
+  const { readFile } = await import("node:fs/promises");
+  return readFile(file, "utf8").catch(() => "");
+}
+
+describe("timed-out plugin catalogue refresh", () => {
+  test("stops the ACP probe stuck in session/new and keeps the provider's running agent", async () => {
+    const logger = createTestLogger();
+    const home = await mkdtemp(join(tmpdir(), "paseo-acp-refresh-timeout-"));
+    const catalogCwd = join(home, "catalog");
+    const storage = new AgentStorage(join(home, "agents"), logger);
+    const script = join(home, "agent.cjs");
+    const { mkdir, readFile, writeFile } = await import("node:fs/promises");
+    await mkdir(catalogCwd);
+    // The catalogue probe records its PID, never answers session/new, and ignores stdin EOF.
+    await writeFile(
+      script,
+      `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { createInterface } = require("node:readline");
+      const catalogCwd = ${JSON.stringify(catalogCwd)};
+      const send = (msg) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...msg }) + "\\n");
+      createInterface({ input: process.stdin }).on("line", (line) => {
+        const msg = JSON.parse(line);
+        if (msg.method === "initialize") {
+          send({ id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+        } else if (msg.method === "session/new" && msg.params.cwd === catalogCwd) {
+          setInterval(() => undefined, 1_000);
+          fs.writeFileSync(path.join(catalogCwd, "probe.pid"), String(process.pid));
+        } else if (msg.method === "session/new") {
+          send({ id: msg.id, result: { sessionId: "live-1", configOptions: [] } });
+        } else if (msg.method === "session/prompt") {
+          send({ method: "session/update", params: { sessionId: "live-1", update: {
+            sessionUpdate: "agent_message_chunk", content: { type: "text", text: "still here" },
+          } } });
+          send({ id: msg.id, result: { stopReason: "end_turn" } });
+        } else if (msg.method === "session/close") {
+          send({ id: msg.id, result: {} });
+        }
+      });
+      `,
+    );
+    const registration = runAcpProvider({
+      id: "hanging-catalog-acp",
+      label: "Hanging Catalog ACP",
+      command: [process.execPath, script],
+    });
+    const plugins = new PluginAgentClientRegistry(logger);
+    plugins.replace([registration]);
+    const manager = new AgentManager({ clients: plugins.clients(), registry: storage, logger });
+    try {
+      const agent = await manager.createAgent({ provider: registration.id, cwd: home }, undefined, {
+        workspaceId: undefined,
+      });
+      const client = plugins.clients()[registration.id]!;
+
+      const refresh = runProviderRefreshWithDeadline({
+        label: registration.label,
+        timeoutMs: 1_000,
+        operation: (context) =>
+          client.fetchCatalog({ scope: "workspace", cwd: catalogCwd }, context),
+      });
+      const pidFile = join(catalogCwd, "probe.pid");
+      await expect.poll(() => readIfPresent(pidFile), { timeout: 5_000 }).not.toBe("");
+      const pid = Number(await readFile(pidFile, "utf8"));
+      await expect(refresh).rejects.toThrow(
+        "Timed out refreshing Hanging Catalog ACP after 1000ms",
+      );
+      await expect.poll(() => isRunning(pid), { timeout: 3_000 }).toBe(false);
+
+      const next = await sendPreparedPromptToAgent({
+        agentManager: manager,
+        agentStorage: storage,
+        agentId: agent.id,
+        prompt: "are you still there?",
+        logger,
+      });
+      expect(next.disposition).toBe("turn_started");
+      if (next.disposition === "turn_started") await next.started;
+      await expect
+        .poll(() => manager.getAgent(agent.id)?.lifecycle, { timeout: 3_000 })
+        .toBe("idle");
+    } finally {
+      await Promise.all(manager.listAgents().map((item) => manager.closeAgent(item.id)));
+      await plugins.shutdown();
+      await storage.flush();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 });
 
 /** A diagnostic context for a provider that does not report its installation. */
@@ -3679,4 +3818,280 @@ test("bounds settings wait when Stop is queued behind an unanswered steer", asyn
     await Promise.all(manager.listAgents().map((item) => manager.closeAgent(item.id)));
     await plugins.shutdown();
   }
+});
+
+test("a declared launch wrap still needs session.launch_wrap on the live connection", async () => {
+  const harness = createProviderHarness();
+  const registry = new PluginAgentClientRegistry(createTestLogger());
+  registry.replace([{ ...harness.registration, launchWrap: true }]);
+  expect(registry.definitions()[harness.registration.id]?.supportsLaunchWrap).toBe(true);
+  const client = registry.clients()[harness.registration.id]!;
+  expect(client.supportsLaunchWrap).toBe(true);
+
+  await expect(client.requireLaunchWrap?.()).rejects.toMatchObject({
+    code: "launch_wrap_unsupported",
+  });
+  await expect(
+    client.createSession(
+      { provider: harness.registration.id, cwd: tmpdir() },
+      { wrap: ["/opt/sandbox/bin/run"] },
+    ),
+  ).rejects.toThrow("session.launch_wrap");
+  expect(harness.inputs.some((input) => input.type === "session.open")).toBe(false);
+  await registry.shutdown();
+});
+
+test("a provider that declares no launch wrap is not marked as supporting it", () => {
+  const harness = createProviderHarness();
+  const registry = new PluginAgentClientRegistry(createTestLogger());
+  registry.replace([harness.registration]);
+  expect(registry.definitions()[harness.registration.id]?.supportsLaunchWrap).toBe(false);
+  expect(registry.clients()[harness.registration.id]!.supportsLaunchWrap).toBe(false);
+});
+
+test("a plugin session reopen sends the wrap the session opened with", async () => {
+  const harness = createRewindProviderHarness({ extraCapabilities: ["session.launch_wrap"] });
+  const registry = new PluginAgentClientRegistry(createTestLogger());
+  registry.replace([{ ...harness.registration, launchWrap: true }]);
+  const client = registry.clients()[harness.registration.id]!;
+  await expect(client.requireLaunchWrap?.()).resolves.toBeUndefined();
+  const wrap: [string, ...string[]] = ["/opt/sandbox/bin/run", "--profile", "a b"];
+  const session = await client.createSession(
+    { provider: harness.registration.id, cwd: tmpdir() },
+    { wrap },
+  );
+  await session.run("A");
+
+  await session.revertConversation!({ messageId: "user-A" });
+
+  const opens = harness.inputs.filter((input) => input.type === "session.open");
+  expect(opens.length).toBeGreaterThanOrEqual(2);
+  for (const open of opens) expect(open.config.wrap).toEqual(wrap);
+  await session.close();
+  await registry.shutdown();
+});
+
+describe("plugin provider tool policy", () => {
+  const hubMcpServers = { hub: { type: "http" as const, url: "https://hub.test/mcp" } };
+  const grants = { preapproved: [{ kind: "mcp" as const, server: "hub", tool: "reply" }] };
+
+  async function createWithToolPolicy(
+    capabilities: ProviderConnection["capabilities"],
+    toolPolicy: { preapproved: (typeof grants)["preapproved"] },
+  ) {
+    const logger = createTestLogger();
+    const harness = createProviderHarness({ capabilities });
+    const plugins = new PluginAgentClientRegistry(logger);
+    plugins.replace([harness.registration]);
+    const registry = buildProviderRegistry(logger, { pluginProviders: plugins.definitions() });
+    const manager = new AgentManager({
+      logger,
+      clients: { "plugin-direct": registry["plugin-direct"].createClient(logger) },
+      providerDefinitions: { "plugin-direct": registry["plugin-direct"] },
+    });
+    const created = manager
+      .createAgent(
+        { provider: "plugin-direct", cwd: tmpdir(), mcpServers: hubMcpServers, toolPolicy },
+        undefined,
+        { workspaceId: undefined },
+      )
+      .then(
+        (agent) => ({ agent, error: null }),
+        (error: unknown) => ({ agent: null, error }),
+      );
+    const result = await created;
+    const opened = harness.inputs.filter((input) => input.type === "session.open");
+    await Promise.all(manager.listAgents().map((item) => manager.closeAgent(item.id)));
+    await plugins.shutdown();
+    return { ...result, opened };
+  }
+
+  test.each([
+    ["exact grants", grants],
+    ["an empty grant list", { preapproved: [] }],
+  ])(
+    "a plugin without permission.tool_policy refuses %s with ToolPolicyUnsupportedError",
+    async (_label, toolPolicy) => {
+      const result = await createWithToolPolicy(CAPABILITIES, toolPolicy);
+
+      expect(result.error).toBeInstanceOf(ToolPolicyUnsupportedError);
+      expect(result.error).toMatchObject({
+        code: "tool_policy_unsupported",
+        provider: "plugin-direct",
+      });
+      expect(result.opened).toEqual([]);
+    },
+  );
+
+  test.each([
+    ["exact grants", grants],
+    ["an empty grant list", { preapproved: [] }],
+  ])("a plugin with permission.tool_policy opens with %s", async (_label, toolPolicy) => {
+    const result = await createWithToolPolicy(
+      [...CAPABILITIES, "permission.tool_policy"],
+      toolPolicy,
+    );
+
+    expect(result.error).toBeNull();
+    expect(result.opened).toHaveLength(1);
+    expect(result.opened[0]).toMatchObject({ config: { toolPolicy } });
+  });
+});
+
+describe("plugin ACP hung-cancel retirement through AgentManager (#3256)", () => {
+  async function writeHungAcpScript(
+    dir: string,
+    options: { pidLog: string; methodLog: string; loadSession: boolean },
+  ): Promise<string> {
+    const scriptPath = join(dir, "hung-acp.mjs");
+    await writeFsFile(
+      scriptPath,
+      [
+        `import { appendFileSync } from "node:fs";`,
+        `import { createInterface } from "node:readline";`,
+        `const cfg = ${JSON.stringify(options)};`,
+        `appendFileSync(cfg.pidLog, String(process.pid) + "\\n");`,
+        `const write = (msg) => process.stdout.write(JSON.stringify(msg) + "\\n");`,
+        `createInterface({ input: process.stdin }).on("line", (line) => {`,
+        `  if (!line.trim()) return;`,
+        `  const msg = JSON.parse(line);`,
+        `  appendFileSync(cfg.methodLog, JSON.stringify({ pid: process.pid, method: msg.method }) + "\\n");`,
+        `  if (msg.method === "initialize") {`,
+        `    write({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: cfg.loadSession ? { loadSession: true } : {} } });`,
+        `    return;`,
+        `  }`,
+        `  if (msg.method === "session/new") {`,
+        `    write({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "plugin-acp-1" } });`,
+        `    return;`,
+        `  }`,
+        `  if (msg.method === "session/load") {`,
+        `    write({ jsonrpc: "2.0", id: msg.id, result: {} });`,
+        `    return;`,
+        `  }`,
+        `  if (msg.method === "session/prompt") {`,
+        `    const text = msg.params?.prompt?.[0]?.text ?? "";`,
+        `    if (text.startsWith("hang")) return;`,
+        `    write({ jsonrpc: "2.0", method: "session/update", params: { sessionId: msg.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "reply:" + text } } } });`,
+        `    write({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });`,
+        `  }`,
+        `});`,
+      ].join("\n"),
+      "utf8",
+    );
+    return scriptPath;
+  }
+
+  test("retires a hung resumable plugin ACP child on Stop and transparently reloads on the next prompt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "paseo-plugin-acp-e2e-resumable-"));
+    const logger = createTestLogger();
+    const pidLog = join(dir, "pids.log");
+    const methodLog = join(dir, "methods.jsonl");
+    const scriptPath = await writeHungAcpScript(dir, { pidLog, methodLog, loadSession: true });
+    const registration = runAcpProvider({
+      id: "hung-resumable-plugin",
+      label: "Hung Resumable Plugin",
+      command: [process.execPath, scriptPath],
+      acpOptions: { interruptGraceMs: 120, interruptKillGraceMs: 120 },
+    });
+    const plugins = new PluginAgentClientRegistry(logger);
+    plugins.replace([registration]);
+    const registry = buildProviderRegistry(logger, { pluginProviders: plugins.definitions() });
+    const manager = new AgentManager({
+      logger,
+      clients: { "hung-resumable-plugin": registry["hung-resumable-plugin"].createClient(logger) },
+      providerDefinitions: { "hung-resumable-plugin": registry["hung-resumable-plugin"] },
+    });
+    try {
+      const agent = await manager.createAgent(
+        { provider: "hung-resumable-plugin", cwd: dir },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const pidsAfterOpen = (await readFsFile(pidLog, "utf8")).trim().split("\n").map(Number);
+      const firstSessionPid = pidsAfterOpen.at(-1)!;
+
+      const firstRun = await startAgentRun(manager, agent.id, "hang-forever", logger);
+      if (firstRun.disposition === "turn_started") await firstRun.started;
+      expect(manager.getAgent(agent.id)?.lifecycle).toBe("running");
+
+      const cancelResult = await manager.cancelAgentRun(agent.id);
+      expect(cancelResult).toEqual({ status: "settled" });
+      expect(() => process.kill(firstSessionPid, 0)).toThrow();
+      expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+
+      // Next prompt transparently spawns a fresh child and calls session/load.
+      const nextRun = await startAgentRun(manager, agent.id, "after-stop", logger);
+      if (nextRun.disposition === "turn_started") await nextRun.started;
+      const done = await manager.waitForAgentEvent(agent.id);
+      expect(done.status).toBe("idle");
+      expect(done.lastMessage).toBe("reply:after-stop");
+
+      const allPids = (await readFsFile(pidLog, "utf8")).trim().split("\n").map(Number);
+      const reloadedPid = allPids.at(-1)!;
+      expect(reloadedPid).not.toBe(firstSessionPid);
+      const methods = (await readFsFile(methodLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { pid: number; method: string });
+      expect(
+        methods.some((entry) => entry.pid === reloadedPid && entry.method === "session/load"),
+      ).toBe(true);
+    } finally {
+      await Promise.all(manager.listAgents().map((item) => manager.closeAgent(item.id)));
+      await plugins.shutdown();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("retires a hung non-resumable plugin ACP child on Stop and surfaces a clear error state", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "paseo-plugin-acp-e2e-nonresumable-"));
+    const logger = createTestLogger();
+    const pidLog = join(dir, "pids.log");
+    const methodLog = join(dir, "methods.jsonl");
+    const scriptPath = await writeHungAcpScript(dir, { pidLog, methodLog, loadSession: false });
+    const registration = runAcpProvider({
+      id: "hung-nonresumable-plugin",
+      label: "Hung Non-Resumable Plugin",
+      command: [process.execPath, scriptPath],
+      acpOptions: { interruptGraceMs: 120, interruptKillGraceMs: 120 },
+    });
+    const plugins = new PluginAgentClientRegistry(logger);
+    plugins.replace([registration]);
+    const registry = buildProviderRegistry(logger, { pluginProviders: plugins.definitions() });
+    const manager = new AgentManager({
+      logger,
+      clients: {
+        "hung-nonresumable-plugin": registry["hung-nonresumable-plugin"].createClient(logger),
+      },
+      providerDefinitions: { "hung-nonresumable-plugin": registry["hung-nonresumable-plugin"] },
+    });
+    try {
+      const agent = await manager.createAgent(
+        { provider: "hung-nonresumable-plugin", cwd: dir },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const firstSessionPid = (await readFsFile(pidLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map(Number)
+        .at(-1)!;
+
+      const firstRun = await startAgentRun(manager, agent.id, "hang-forever", logger);
+      if (firstRun.disposition === "turn_started") await firstRun.started;
+      expect(manager.getAgent(agent.id)?.lifecycle).toBe("running");
+
+      const cancelResult = await manager.cancelAgentRun(agent.id);
+      expect(cancelResult).toEqual({ status: "settled" });
+      expect(() => process.kill(firstSessionPid, 0)).toThrow();
+      await expect
+        .poll(() => manager.getAgent(agent.id)?.lifecycle, { timeout: 2_000 })
+        .toBe("error");
+      expect(manager.getAgent(agent.id)?.lastError).toMatch(/does not support session resume/i);
+    } finally {
+      await Promise.all(manager.listAgents().map((item) => manager.closeAgent(item.id)));
+      await plugins.shutdown();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

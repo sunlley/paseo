@@ -19,6 +19,7 @@ const desktopPackagePath = new URL("packages/desktop/package.json", repoRoot);
 
 const gatedCiJobs = new Map([
   ["quality", { name: "quality", contracts: ["format", "quality", "relay", "sdk"] }],
+  ["sdk-tests-windows", { name: "sdk-tests (windows-latest)", contract: "sdk" }],
   ["typecheck", { name: "typecheck", contract: "quality" }],
   ["server-tests-ubuntu", { name: "server-tests (ubuntu-latest)", contracts: ["server", "hub"] }],
   ["server-tests-windows", { name: "server-tests (windows-latest)", contracts: ["server", "hub"] }],
@@ -116,6 +117,7 @@ test("gated checks are statically named jobs with real job-level gating", () => 
 test("pull-request checks run for every base branch, including stacked PRs", () => {
   for (const workflowPath of [
     ciWorkflowPath,
+    nixWorkflowPath,
     new URL(".github/workflows/desktop-packages.yml", repoRoot),
   ]) {
     const trigger = readFileSync(workflowPath, "utf8").split("jobs:", 1)[0];
@@ -125,13 +127,18 @@ test("pull-request checks run for every base branch, including stacked PRs", () 
   }
 });
 
-test("change gating allows superseded workflow runs to cancel", () => {
+test("superseded CI runs cancel everywhere except main", () => {
   const ci = readFileSync(ciWorkflowPath, "utf8");
-  assert.match(
-    ci,
-    /^concurrency:\n  group: ci-\$\{\{ github\.workflow \}\}-\$\{\{ github\.ref \}\}\n  cancel-in-progress: true$/m,
-    "a newer push to any ref, main included, cancels the superseded run",
-  );
+  const concurrency =
+    /^concurrency:\n  group: ci-\$\{\{ github\.workflow \}\}-\$\{\{ github\.ref \}\}\n  cancel-in-progress: \$\{\{ (.+) \}\}$/m.exec(
+      ci,
+    );
+  assert.ok(concurrency, "CI groups runs by ref and decides cancellation per ref");
+  const cancels = (ref) => runInNewContext(concurrency[1], { github: { ref } });
+  // A run cancelled mid-flight leaves CANCELLED checks, which paint the main commit red.
+  assert.equal(cancels("refs/heads/main"), false);
+  assert.equal(cancels("refs/pull/1/merge"), true);
+  assert.equal(cancels("refs/heads/release/1.0"), true);
   for (const workflowPath of [ciWorkflowPath, dockerWorkflowPath, nixWorkflowPath]) {
     const source = readFileSync(workflowPath, "utf8");
     assert.doesNotMatch(
@@ -145,6 +152,14 @@ test("change gating allows superseded workflow runs to cancel", () => {
 test("published npm packages declare and ship the repository license", () => {
   const rootManifest = JSON.parse(readFileSync(new URL("package.json", repoRoot), "utf8"));
   assert.match(rootManifest.scripts["release:publish"], /scripts\/publish-release-packages\.mjs/);
+  assert.match(
+    rootManifest.scripts["release:ship"],
+    /^npm run release:push && npm run release:publish$/,
+  );
+  assert.match(
+    rootManifest.scripts["release:ship:beta"],
+    /^npm run release:push && npm run release:publish:beta$/,
+  );
   const workspaceArgs = PUBLISH_WORKSPACES.map((workspace) => `--workspace=${workspace}`);
   const packed = JSON.parse(
     execFileSync("npm", ["pack", "--dry-run", "--ignore-scripts", "--json", ...workspaceArgs], {
@@ -256,6 +271,7 @@ test("PR routing declares stable behavior ownership", () => {
       "packages/plugin/**",
       "plugin-examples/**",
       "public-docs/plugins/**",
+      "skills/paseo-plugin/**",
       "packages/client/**",
       "packages/highlight/**",
       "packages/protocol/**",
@@ -284,7 +300,7 @@ test("PR routing declares stable behavior ownership", () => {
       "packages/react-native-enriched-markdown/**",
     ],
     relay: ["packages/relay/**"],
-    cli: ["packages/cli/**"],
+    cli: ["packages/cli/**", "packages/server/**", "plugins/**"],
   });
 });
 
@@ -365,15 +381,12 @@ test("browser and desktop tests have exclusive, directory-owned suites", () => {
   ]);
 });
 
-test("packaging runs on main without allocating pull-request runners", () => {
-  for (const workflowPath of [dockerWorkflowPath, nixWorkflowPath]) {
-    const source = readFileSync(workflowPath, "utf8");
-    const trigger = source.split("jobs:", 1)[0];
-    assert.match(trigger, /push:\s*\n\s+branches: \[main\]/);
-    assert.doesNotMatch(trigger, /pull_request/);
-    assert.doesNotMatch(source, /dorny\/paths-filter/);
-  }
+test("Docker packaging runs on main while Nix verifies packaging PRs on Linux", () => {
   const docker = readFileSync(dockerWorkflowPath, "utf8");
+  const dockerTrigger = docker.split("jobs:", 1)[0];
+  assert.match(dockerTrigger, /push:\s*\n\s+branches: \[main\]/);
+  assert.doesNotMatch(dockerTrigger, /pull_request/);
+  assert.doesNotMatch(docker, /dorny\/paths-filter/);
   assert.match(
     docker,
     /group: docker-\$\{\{ github\.workflow \}\}-\$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.publish == 'true' && format\('publish-\{0\}', inputs\.paseo_version \|\| github\.run_id\) \|\| github\.ref \}\}/,
@@ -384,8 +397,34 @@ test("packaging runs on main without allocating pull-request runners", () => {
     /cancel-in-progress: \$\{\{ !startsWith\(github\.ref, 'refs\/tags\/'\) && !\(github\.event_name == 'workflow_dispatch' && inputs\.publish == 'true'\) \}\}/,
     "Docker cancels superseded non-tag main checks while preserving tag and manual publish runs",
   );
+
   const nix = readFileSync(nixWorkflowPath, "utf8");
-  assert.match(nix.split("jobs:", 1)[0], /^\s+workflow_dispatch:/m);
+  const nixTrigger = nix.split("jobs:", 1)[0];
+  assert.match(nixTrigger, /push:\s*\n\s+branches: \[main\]/);
+  assert.match(nixTrigger, /^\s+workflow_dispatch:/m);
+  assert.match(nixTrigger, /pull_request:\s*\n\s+paths:/);
+  for (const expectedPath of [
+    "nix/**",
+    "packages/server/**",
+    "packages/cli/**",
+    "packages/desktop/**",
+    "scripts/trace-daemon.mjs",
+    "scripts/is-main-module.mjs",
+    ".github/workflows/nix.yml",
+  ]) {
+    assert.match(
+      nixTrigger,
+      new RegExp(`- "${expectedPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`),
+      `Nix PR paths include ${expectedPath}`,
+    );
+  }
+  assert.match(nixTrigger, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/);
+  assert.doesNotMatch(nix, /dorny\/paths-filter/);
+  assert.match(
+    jobBlocks(nix).get("build-desktop-darwin").join("\n"),
+    /^    if: \$\{\{ github\.event_name != 'pull_request' \}\}$/m,
+    "Nix PR checks run the Linux build and daemon smoke without allocating macOS runners",
+  );
 });
 
 test("CI and desktop packaging verify release branches isolated from main traffic", () => {
@@ -430,13 +469,74 @@ test("stable iOS releases upload once and distribute to external testers before 
     review,
     /APP_BUILD_VERSION="\$\{\{ needs\.build_ios\.outputs\.app_build_version \}\}"/,
   );
+  assert.match(review, /REPLACE_IN_REVIEW="false"/);
   assert.match(review, /bundle exec fastlane ios submit_review/);
+});
+
+test("iOS App Store review queue EAS workflows and Fastlane lanes stay wired and tested", () => {
+  const resubmit = readFileSync(
+    new URL("packages/app/.eas/workflows/resubmit-ios-review.yml", repoRoot),
+    "utf8",
+  );
+  assert.match(
+    resubmit,
+    /replace_in_review:\s*\n\s+type: boolean\s*\n\s+required: false\s*\n\s+default: false/,
+  );
+  assert.match(resubmit, /export REPLACE_IN_REVIEW="\$\{\{ inputs\.replace_in_review \}\}"/);
+  assert.match(resubmit, /bundle exec fastlane ios submit_review/);
+
+  const status = readFileSync(
+    new URL("packages/app/.eas/workflows/ios-review-status.yml", repoRoot),
+    "utf8",
+  );
+  assert.match(status, /^  workflow_dispatch: \{\}$/m);
+  assert.match(status, /bundle exec fastlane ios review_status/);
+
+  const cancel = readFileSync(
+    new URL("packages/app/.eas/workflows/cancel-ios-review.yml", repoRoot),
+    "utf8",
+  );
+  assert.match(cancel, /expected_version:\s*\n\s+type: string\s*\n\s+required: false/);
+  assert.match(cancel, /export EXPECTED_VERSION="\$\{\{ inputs\.expected_version \}\}"/);
+  assert.match(cancel, /bundle exec fastlane ios cancel_review/);
+
+  // Validate all EAS workflow YAML files with Ruby's built-in Psych YAML parser,
+  // check Ruby syntax on Fastlane files, and run the Ruby unit test suite.
+  const yamlCheck = spawnSync(
+    "ruby",
+    [
+      "-ryaml",
+      "-e",
+      'ARGV.each { |p| data = YAML.safe_load_file(p); raise "Invalid YAML: #{p}" unless data.is_a?(Hash) && data["jobs"].is_a?(Hash) }',
+      "packages/app/.eas/workflows/release-mobile.yml",
+      "packages/app/.eas/workflows/resubmit-ios-review.yml",
+      "packages/app/.eas/workflows/ios-review-status.yml",
+      "packages/app/.eas/workflows/cancel-ios-review.yml",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+  assert.equal(yamlCheck.status, 0, yamlCheck.stderr || yamlCheck.stdout);
+
+  for (const rubyFile of [
+    "packages/app/fastlane/Fastfile",
+    "packages/app/fastlane/ios_review.rb",
+    "packages/app/fastlane/ios_review_test.rb",
+  ]) {
+    const syntax = spawnSync("ruby", ["-c", rubyFile], { cwd: repoRoot, encoding: "utf8" });
+    assert.equal(syntax.status, 0, syntax.stderr || syntax.stdout);
+  }
+
+  const unitTests = spawnSync("ruby", ["packages/app/fastlane/ios_review_test.rb"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  assert.equal(unitTests.status, 0, `${unitTests.stdout}\n${unitTests.stderr}`);
 });
 
 test("eight Playwright shards share two-worker coverage", () => {
   const source = readFileSync(ciWorkflowPath, "utf8");
   const jobs = jobBlocks(source);
-  assert.equal(jobs.size, 21);
+  assert.equal(jobs.size, 22);
   for (let shard = 1; shard <= 8; shard++) {
     const job = jobs.get(`playwright-${shard}`).join("\n");
     assert.match(job, new RegExp(`PLAYWRIGHT_SHARD: "${shard}/8"`));
@@ -466,7 +566,6 @@ test("quality preserves commands and routes each domain independently after fail
     format: ["npm run format:check"],
     quality: [
       "npx --yes lockfile-lint --path package-lock.json --type npm --allowed-hosts npm --validate-https --validate-integrity",
-      "npm audit signatures",
       "npm run lint",
       "node --test scripts/oxlint/paseo-plugin.test.mjs",
     ],
@@ -515,6 +614,13 @@ test("quality preserves commands and routes each domain independently after fail
     assert.equal(accepts(expression, {}, { installed: false }), false);
   }
   assert.equal(accepts(jobCondition, {}, { cancelled: true }), false);
+});
+
+test("plugin SDK tests run on real Windows", () => {
+  const sdk = jobBlocks(readFileSync(ciWorkflowPath, "utf8")).get("sdk-tests-windows").join("\n");
+  assert.match(sdk, /^    runs-on: windows-latest$/m);
+  assert.match(sdk, /run: npm run test --workspace=@getpaseo\/plugin$/m);
+  assert.doesNotMatch(sdk, /continue-on-error/);
 });
 
 test("Windows units and integration run independently with complete routed coverage", () => {
@@ -568,7 +674,7 @@ test("Windows units and integration run independently with complete routed cover
   assert.doesNotMatch(invocations[0], / -t /);
   assert.equal(
     invocations[1],
-    'vitest run --fileParallelism --maxWorkers=3 src/server/agent/providers/omp/history.e2e.test.ts src/server/daemon-e2e/git-operations.e2e.test.ts src/server/session.create-agent-worktree-autoarchive.e2e.test.ts src/server/agent/providers/opencode-bridge.local.e2e.test.ts src/server/daemon-e2e/relay-transport.e2e.test.ts src/server/agent/agent-mcp.e2e.test.ts -t "agent MCP protocol negotiation|merges into|creates a worktree and auto-archives both|versioned runtime|oversized attachments|connected hosts|password-protected daemon refuses|replays selected OMP history"',
+    'vitest run --fileParallelism --maxWorkers=3 src/server/agent/providers/omp/history.e2e.test.ts src/server/daemon-e2e/git-operations.e2e.test.ts src/server/session.create-agent-worktree-autoarchive.e2e.test.ts src/server/agent/providers/opencode-bridge.local.e2e.test.ts src/server/daemon-e2e/relay-transport.e2e.test.ts src/server/agent/agent-mcp.e2e.test.ts src/server/plugins/agent-tools.e2e.test.ts -t "agent MCP protocol negotiation|merges into|creates a worktree and auto-archives both|versioned runtime|oversized attachments|connected hosts|password-protected daemon refuses|replays selected OMP history|changes the launch wrap"',
   );
   const serverConfig = readFileSync(new URL("packages/server/vitest.config.ts", repoRoot), "utf8");
   assert.doesNotMatch(serverConfig, /maxWorkers:\s*1\b/);
@@ -616,6 +722,18 @@ test("desktop release creates release-manifests before entering it and uses the 
   const workflow = readFileSync(new URL(".github/workflows/desktop-release.yml", repoRoot), "utf8");
   assert.match(workflow, /scripts\/macos-xcrun-retry\.sh/);
   assert.match(workflow, /mkdir -p release-manifests\s*\n\s+cd release-manifests/);
+});
+
+test("desktop release stamps an 18-hour rollout on a tag push and by default on a manual run", () => {
+  const workflow = readFileSync(new URL(".github/workflows/desktop-release.yml", repoRoot), "utf8");
+  const manualRunDefault = /\n {6}rollout_hours:\n(?: {8}.*\n)*? {8}default: "(\d+)"/.exec(
+    workflow,
+  );
+  const tagPushDefault =
+    /\n {2}ROLLOUT_HOURS: \$\{\{.*inputs\.rollout_hours \|\| '(\d+)' \}\}/.exec(workflow);
+
+  assert.equal(manualRunDefault?.[1], "18");
+  assert.equal(tagPushDefault?.[1], "18");
 });
 
 test("macOS release xcrun wrapper retries transient stapling and notarization failures without rebuilding", async (t) => {

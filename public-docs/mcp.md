@@ -104,14 +104,17 @@ Paseo agents receive finish, error, and permission notifications by default; set
 
 ### Workspaces
 
-| Tool                | Function                                                                                                                                                                                                                                                                                                        |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `create_workspace`  | Create a local or worktree-isolated workspace. Worktrees can branch off, check out a branch, or a PR. `background: true` hides it from default lists and the sidebar while preserving history and access by ID. Omission inherits the calling agent’s workspace setting, or defaults to false without a caller. |
-| `list_workspaces`   | List active workspaces and their directories and isolation. Use `includeBackground: true` to include background workspaces.                                                                                                                                                                                     |
-| `rename_workspace`  | Change the user-visible name of the current or specified workspace.                                                                                                                                                                                                                                             |
-| `archive_workspace` | Archive a workspace and the sessions it owns.                                                                                                                                                                                                                                                                   |
+| Tool                | Function                                                                                                                                                                                                                                                                                                                                            |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create_workspace`  | Create a local or worktree-isolated workspace, optionally with initial `metadata`. Worktrees can branch off, check out a branch, or a PR. `background: true` hides it from default lists and the sidebar while preserving history and access by ID. Omission inherits the calling agent’s workspace setting, or defaults to false without a caller. |
+| `list_workspaces`   | List active workspaces with their directories, isolation, and `metadata`. Use `includeBackground: true` to include background workspaces.                                                                                                                                                                                                           |
+| `update_workspace`  | Update the current or specified workspace's `title` (`null` clears it) and/or structured `metadata` (top-level keys replace; `null` removes a key).                                                                                                                                                                                                 |
+| `rename_workspace`  | Change the user-visible name of the current or specified workspace.                                                                                                                                                                                                                                                                                 |
+| `archive_workspace` | Archive a workspace and the sessions it owns.                                                                                                                                                                                                                                                                                                       |
 
 For worktree isolation, `create_workspace` accepts the same useful choices as the app: branch off from a base, check out an existing branch, or check out a pull request. The worktree remains an implementation detail of the workspace lifecycle.
+
+Workspace `metadata` stores arbitrary JSON values under string keys and persists across daemon restarts. Common keys include `issues` (an array of issue URLs or references) and `body`, `summary`, or `notes`, alongside any custom keys your workflow needs. Pass `null` for a key in `update_workspace` to remove it.
 
 ### Workspace scripts
 
@@ -155,7 +158,7 @@ Both use the same cron engine, but they have deliberately different interfaces.
 
 MCP heartbeats are ephemeral: create or delete them. To change one, delete it and create a replacement. Pause, resume, update, inspect, logs, and run-once apply to new-agent schedules only.
 
-New-agent run workspaces are archived when each run ends by default. `create_schedule` and `update_schedule` do not expose **Archive on finish** (`archiveOnFinish`); [change the option in the app](/docs/schedules#keep-run-workspaces) to keep subsequent run workspaces active.
+New-agent run workspaces are archived when each run ends by default. Pass `archiveOnFinish: false` to `create_schedule` or `update_schedule` to [keep subsequent run workspaces](/docs/schedules#keep-run-workspaces) active; it is the **Archive on finish** option in the app.
 
 ### Agent profiles
 

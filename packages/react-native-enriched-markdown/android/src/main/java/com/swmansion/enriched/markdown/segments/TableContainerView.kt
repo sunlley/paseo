@@ -36,7 +36,6 @@ import com.swmansion.enriched.markdown.utils.text.extensions.replaceMathSpansWit
 import com.swmansion.enriched.markdown.utils.text.span.prepareWidthAwareSpans
 import com.swmansion.enriched.markdown.utils.text.view.LinkLongPressMovementMethod
 import com.swmansion.enriched.markdown.utils.text.view.cancelJSTouchForLinkTap
-import com.swmansion.enriched.markdown.utils.text.view.reallowParentInterceptIfLinkReleased
 import com.swmansion.enriched.markdown.views.ClaimingHorizontalScrollView
 import com.swmansion.enriched.markdown.views.ContextMenuPopup
 import kotlin.math.ceil
@@ -619,12 +618,12 @@ class TableContainerView(
       importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
     }
 
+    override fun performLongClick(): Boolean =
+      (movementMethod as? LinkLongPressMovementMethod)?.performLinkLongClick(this) == true || super.performLongClick()
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
       val result = super.onTouchEvent(event)
-      when (event.action) {
-        MotionEvent.ACTION_DOWN -> cancelJSTouchForLinkTap(event)
-        else -> reallowParentInterceptIfLinkReleased()
-      }
+      if (event.action == MotionEvent.ACTION_DOWN) cancelJSTouchForLinkTap(event)
       return result
     }
   }

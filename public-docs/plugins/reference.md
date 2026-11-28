@@ -15,15 +15,19 @@ Migrating an existing plugin? Follow the standalone [runtime-entry migration gui
 Local plugins are directory sources installed into one Paseo daemon. A plugin can contribute:
 
 - React Native screens and sidebar header and footer items to Paseo clients;
+- a [sidebar view](/docs/plugins/sidebar-views) that replaces the sidebar list, and [badges](#workspace-row-badge-items) on workspace rows;
 - workspace and agent panels opened as workspace tabs;
 - [file panels](#file-panels) for viewing or editing matching files;
 - global, workspace, and agent actions in the Command Center;
-- slash commands in the message composer;
+- slash commands, [controls](#composer-items), pills, and searchable external resources in the message composer;
+- [buttons](#header-buttons) in the workspace header and [fields](#new-workspace-items) on the New workspace screen;
+- [settings screens](#settings-screens) and light and dark themes in Settings → Appearance;
 - transformed and daemon-pushed agent timeline rows;
-- light and dark themes in Settings → Appearance;
-- schema-validated RPC handlers running beside the daemon;
-- normal Paseo operations through the TypeScript SDK;
-- searchable external resources in the message composer.
+- [notifications](#notifications) delivered to desktop, web, and mobile clients with custom tap routing;
+- schema-validated RPC handlers and event streams running beside the daemon;
+- [hooks](/docs/plugins/hooks) that change or observe workspace, worktree, and agent operations;
+- [agent providers](/docs/plugins/providers), [usage sources](#usage-sources), and [worktree managers](#worktree-managers);
+- normal Paseo operations through the TypeScript SDK.
 
 Plugin code is trusted and unsandboxed. Client surfaces run in the Paseo app. Backend contributions run in a subprocess with access to the daemon machine, including its files, processes, credentials, and network.
 
@@ -401,7 +405,7 @@ Use `openSettings`, `openScreen`, and `openPanel` for your own registered contri
 ### Server runtime
 
 Paseo provides `@getpaseo/plugin`, `@getpaseo/plugin/server`,
-`@getpaseo/plugin/server/provider`, `@getpaseo/plugin/server/acp`, and `zod` to server code. Backend
+`@getpaseo/plugin/server/provider`, `@getpaseo/plugin/server/acp`, `@getpaseo/plugin/server/usage`, and `zod` to server code. Backend
 contributions run in a daemon subprocess with Node access to the host machine. Keep filesystem,
 process, credential, and other machine-local work under `server/`. A plugin without
 `index.server.ts` starts no subprocess.
@@ -597,6 +601,7 @@ interface UsageSourceRegistration {
   label: string;
   icon?: string;
   provider?: string;
+  providers?: readonly string[];
   input: ZodType;
   discover(scope: UsageScope): Promise<UsageAccount[]>;
   fetch(input: unknown): Promise<UsageReport>;
@@ -627,6 +632,18 @@ Resolve the session account from that session's launch environment. Return `[]` 
 Never scan default stores from session discovery or scan agents from global discovery. Discovery is a query, with no agent
 lifecycle hooks. Closed agents have no session scope until resumed.
 
+The host's Usage list also runs session discovery once for each enabled provider that configures a
+config-directory or credential-store locator env var, so a custom provider's login appears before any
+of its agents run. The daemon dispatches that scope **only** to usage sources whose declared
+`providers` list explicitly includes that provider's base ID (or its own ID when it extends none),
+with no `model` and with `env` filtered to this explicit allowlist of non-secret locator variables:
+`HOME`, `USERPROFILE`, `USER`, `APPDATA`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
+`CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `CODEX_HOME`, `OPENCODE_CONFIG_DIR`,
+`OPENCODE_DB`, `PI_CODING_AGENT_DIR`, `PI_CONFIG_DIR`, `PI_PROFILE`, `OMP_PROFILE`,
+`KIMI_CODE_HOME`, and `AGENT_CLI_CREDENTIAL_STORE`. Auth tokens, API keys, and arbitrary env entries
+are stripped. The daemon sets the `harness` of each login found this way to the provider's label, so
+a failed login names its provider. A login that global discovery found first keeps its `harness`.
+
 Inputs name credential stores; never put credentials in inputs or reports. Paseo validates each
 input against your schema before calling `fetch()`. The same key in any scope is the same report;
 fetches share a five-minute cache only when their ordered login inputs match. Each login fetch
@@ -634,20 +651,19 @@ has a 20-second deadline.
 
 Built-in session routes:
 
-| Source                 | Session                                       | Login store                                                                                    |
-| ---------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Claude                 | `claude`                                      | `CLAUDE_CONFIG_DIR`, or the default; on macOS, the directory's Keychain entry takes precedence |
-| Claude                 | `pi`, `omp` with `anthropic/…` model          | That harness's Anthropic login store                                                           |
-| Codex                  | `codex`                                       | `CODEX_HOME/auth.json`, or the default                                                         |
-| Codex                  | `pi`, `opencode`, `omp` with `openai/…` model | That harness's OpenAI login store                                                              |
-| Cursor                 | `cursor`                                      | cursor-agent's `auth.json` for that session's `XDG_CONFIG_HOME`, `APPDATA`, or home directory  |
-| Muse                   | `muse`                                        | That session's own Muse launch/config                                                          |
-| Other built-in sources | Any                                           | No session discovery                                                                           |
+| Source                 | Session                                       | Login store                                                                                                                                                    |
+| ---------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude                 | `claude`                                      | `CLAUDE_CONFIG_DIR`, or the default; on macOS, the directory's Keychain entry takes precedence                                                                 |
+| Claude                 | `pi`, `omp` with `anthropic/…` model          | That harness's Anthropic login store                                                                                                                           |
+| Codex                  | `codex`                                       | `CODEX_HOME/auth.json`, or the default                                                                                                                         |
+| Codex                  | `pi`, `opencode`, `omp` with `openai/…` model | That harness's OpenAI login store                                                                                                                              |
+| Cursor                 | `cursor`                                      | cursor-agent's `auth.json` for that session's `XDG_CONFIG_HOME`, `APPDATA`, or home directory; on macOS, the Keychain unless `AGENT_CLI_CREDENTIAL_STORE=file` |
+| Muse                   | `muse`                                        | That session's own Muse launch/config                                                                                                                          |
+| Other built-in sources | Any                                           | No session discovery                                                                                                                                           |
 
 Claude excludes Bedrock, Vertex, and foreign `ANTHROPIC_BASE_URL` sessions. Codex excludes sessions
 with `OPENAI_BASE_URL` set. Cursor excludes sessions that authenticate with `CURSOR_API_KEY` or
-`CURSOR_AUTH_TOKEN`, and macOS sessions that keep the login in the Keychain, the default unless
-`AGENT_CLI_CREDENTIAL_STORE=file`.
+`CURSOR_AUTH_TOKEN`.
 
 Use a stable account key: 1–128 characters from `[A-Za-z0-9._-]`. It identifies the account or
 organization whose quota is metered and survives token rotation. Never use a credential or raw
@@ -860,6 +876,90 @@ export default function contribute(server: PluginServerContext) {
 
 See the complete [worktrunk example](https://github.com/getpaseo/paseo/tree/main/plugin-examples/worktrunk).
 
+## Tunnel providers {#tunnel-providers}
+
+**Requires Paseo 0.18.** Register a tunnel provider from `index.server.ts` with
+`server.registerTunnelProvider()` to turn a local HTTP `host:port` target into a public HTTPS URL.
+The registration returns a cleanup function that unregisters the provider and closes its active
+exposures.
+
+```ts
+import {
+  execCommand,
+  spawnProcess,
+  terminateProcess,
+  type PluginServerContext,
+} from "@getpaseo/plugin/server";
+
+export default function contribute(server: PluginServerContext) {
+  return server.registerTunnelProvider({
+    id: "custom-tunnel",
+    label: "Custom Tunnel",
+    description: "Expose local HTTP targets through a custom tunnel binary.",
+    docsUrl: "https://example.com/docs/custom-tunnel",
+    async status({ signal }) {
+      try {
+        const { stdout } = await execCommand("custom-tunnel", ["--version"], {
+          signal,
+          timeout: 5_000,
+        });
+        return { status: "available", detail: stdout.trim() || undefined };
+      } catch {
+        return {
+          status: "unavailable",
+          reason: "custom-tunnel is not installed or not on PATH.",
+          installUrl: "https://example.com/install",
+          fixHint: "Install custom-tunnel and make sure that it is on PATH.",
+        };
+      }
+    },
+    async open(target, { report, signal }) {
+      report({ type: "connecting" });
+      const child = spawnProcess("custom-tunnel", ["http", `${target.host}:${target.port}`], {
+        stdio: "pipe",
+      });
+      signal.addEventListener(
+        "abort",
+        () => {
+          void terminateProcess(child, "SIGTERM").catch(() => undefined);
+        },
+        { once: true },
+      );
+      let ready = false;
+      child.stderr.on("data", (chunk) => {
+        if (ready || signal.aborted) return;
+        const match = /https:\/\/[a-z0-9.-]+/i.exec(String(chunk));
+        if (!match) return;
+        ready = true;
+        report({ type: "ready", url: match[0], stability: "ephemeral" });
+      });
+      await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", () => resolve());
+      });
+      report({ type: "closed", reason: signal.aborted ? "aborted" : undefined });
+    },
+  });
+}
+```
+
+- `id` must match `/^[a-z][a-z0-9._-]*$/` and must be unique across installed and built-in plugins.
+- `status({ paseo, signal })` checks whether the provider can open tunnels on this host. Return
+  `{ status: "available", detail? }` or `{ status: "unavailable", reason, installUrl?, fixHint? }`.
+- `open(target, { paseo, signal, report })` owns one exposure until `signal` aborts or the tunnel
+  closes. `target` carries `{ id, host, port, label?, slug? }`.
+- Call `report(event)` as the exposure changes state:
+  - `{ type: "connecting", detail? }`
+  - `{ type: "ready", url, stability?: "ephemeral" | "stable", detail? }`
+  - `{ type: "reconnecting", reason? }`
+  - `{ type: "error", message, recoverable?: boolean }`
+  - `{ type: "closed", reason? }`
+- Keep `open()` pending while the tunnel stays up. When `signal` aborts, stop child processes or
+  remote rules, report `{ type: "closed" }`, and resolve. If `open()` throws or exits before
+  reporting `ready`, Paseo fails the exposure and removes it cleanly.
+
+See the complete [tunnel-provider example](https://github.com/getpaseo/paseo/tree/main/plugin-examples/tunnel-provider).
+
 ## Entry point and cleanup
 
 Each present entry default-exports one contribution function and returns cleanup. Client entries
@@ -877,6 +977,78 @@ export default function contribute(client: PluginClientContext) {
 ```
 
 Cleanup can be async. Release timers, watchers, sockets, and other resources created by the plugin. Reload, disable, and removal dispose the affected installation. Stopping a server plugin also closes its daemon session and stops its subprocess. Client installations follow [Hosts and lifecycle](#hosts-and-lifecycle), including retention during a temporary disconnect.
+
+## Notifications {#notifications}
+
+**Requires Paseo 0.18.** Call `server.notifications.send()` from a server hook, RPC handler, or background watcher to notify the user on their active desktop/web client or via mobile push when away.
+
+```ts
+// index.server.ts
+import type { PluginServerContext } from "@getpaseo/plugin/server";
+
+export default function contribute(server: PluginServerContext) {
+  const unhook = server.addHook("agent.turn.after", async ({ agent, outcome }) => {
+    if (outcome.kind !== "failed" || agent.background) return;
+    await server.notifications.send({
+      title: agent.title ?? "Agent failed",
+      body: outcome.error.message,
+      key: `agent-failed:${agent.id}`,
+      open: { type: "agent", agentId: agent.id },
+      data: { agentId: agent.id },
+    });
+  });
+  return () => unhook();
+}
+```
+
+### Send input and limits
+
+| Field   | Required | Limit / behavior                                                                                                  |
+| ------- | -------- | ----------------------------------------------------------------------------------------------------------------- |
+| `title` | Yes      | Non-empty string after trimming; truncated to 160 characters if longer.                                           |
+| `body`  | Yes      | Trimmed string; truncated to 500 characters if longer.                                                            |
+| `key`   | No       | Trimmed string, 1–128 characters. An identical key from the same plugin within 60 seconds returns `deduplicated`. |
+| `open`  | No       | Declarative tap target (IDs up to 256 chars, serialized up to 1,024 UTF-8 bytes) used when no handler handles it. |
+| `data`  | No       | Plain JSON object up to 1,024 UTF-8 bytes when serialized, passed to `client.onNotificationOpen`.                 |
+
+Declarative `open` targets require no client entry:
+
+- `{ type: "agent", agentId: string }` opens and focuses the agent. When an active visible client is already focused on that agent, Paseo suppresses the notification.
+- `{ type: "workspace", workspaceId: string }` opens the workspace.
+- `{ type: "screen", screenId: string, params?: Record<string, string> }` opens your plugin's screen with URL params.
+
+`server.notifications.send()` resolves to one of:
+
+- `{ status: "sent", notificationId: string }` when accepted by the daemon for delivery (even if muted on a user's device).
+- `{ status: "deduplicated" }` when `key` matched a notification sent by your plugin within the last 60 seconds.
+- `{ status: "rate_limited" }` when your plugin exceeds its per-plugin token bucket (burst of 10, refilling 1 every 6 seconds).
+
+Invalid fields, an empty `title`, or `open`/`data` larger than 1,024 UTF-8 bytes reject the returned promise. Users can mute all plugin notifications or mute individual plugins in **Settings → Notifications**.
+
+### Handle notification taps on the client
+
+Register `client.onNotificationOpen(handler)` in `index.client.tsx` when you need custom tap routing based on `data`:
+
+```tsx
+// index.client.tsx
+import type { PluginClientContext } from "@getpaseo/plugin/client";
+
+export default function contribute(client: PluginClientContext) {
+  const unsub = client.onNotificationOpen(({ event, openScreen, navigation }) => {
+    if (typeof event.data?.agentId === "string") {
+      navigation.openAgent({ agentId: event.data.agentId, focusHost: true });
+    } else {
+      openScreen({
+        screenId: "alert",
+        params: { notificationId: event.notificationId },
+      });
+    }
+  });
+  return () => unsub();
+}
+```
+
+The handler receives `PluginCommandCapabilities` (`paseo`, `rpc`, `openScreen`, `composers`, `openSettings`), `navigation.openAgent`, `navigation.openWorkspace`, and `event: { type: "opened", notificationId, data }`. Registering `onNotificationOpen` takes ownership of all notification taps for that plugin. On cold launch from a notification tap, Paseo waits for the target host's plugin catalog to finish loading before invoking your handler; if the plugin has no registered handler, every registered handler throws, or the catalog cannot load in time, Paseo falls back to the notification's declarative `open` target. See `plugin-examples/notifications`.
 
 ## Lifecycle hooks
 
@@ -1492,6 +1664,14 @@ return `undefined` until recognizable if the first text is insufficient to ident
 Each replacement may set an optional plugin-local `id`; otherwise Paseo uses its index within that
 source item's output.
 
+A tool-call item can carry provider-specific values in `item.metadata`, typed as
+`Record<string, unknown>`. Check that a key exists and has the type you expect before you use it.
+
+OMP sets `item.metadata.intent`, a short string that says why the agent made the call. It is absent
+when OMP records no intent. OMP 19 and later do not record it for Paseo agents unless you turn on
+OMP's `tools.intentTracing` setting or set `PI_INTENT_TRACING`. Paseo's built-in timeline does not
+display it.
+
 Renderers receive `agentId`, `item`, `timestamp`, `theme`, `host`, and `layout`. Paseo validates
 `item.data` with the registered schema before rendering. Keep transformers synchronous and
 deterministic. Paseo memoizes results by source-item reference and derives replacement identity from
@@ -1895,6 +2075,8 @@ Workspace snapshot fields:
 | `statusEnteredAt`    | ISO timestamp or `null`                                           |
 | `archivingAt`        | ISO timestamp or `null`                                           |
 | `diffStat`           | `{ additions: number; deletions: number } \| null`                |
+| `parentWorkspace`    | `WorkspaceRef \| null`                                            |
+| `metadata`           | `Readonly<Record<string, JsonValue>>`                             |
 
 Agent snapshot fields:
 
@@ -1918,6 +2100,7 @@ Agent snapshot fields:
 | `attentionReason`   | `"finished" \| "error" \| "permission" \| null`                |
 | `parentAgentId`     | `string \| null`                                               |
 | `labels`            | `Record<string, string>`                                       |
+| `metadata`          | `Readonly<Record<string, JsonValue>>`                          |
 
 `backgroundWork.count` is the number of shells and monitors the agent left running after its turn,
 and `0` when none are live. An agent can be `idle` with `attentionReason: "finished"` while that
@@ -1967,13 +2150,13 @@ export default function contribute(client: PluginClientContext) {
 `addFilePanel` takes a `PluginFilePanelContribution` and returns an idempotent cleanup function.
 Paseo also removes the registration when the client entry is unloaded.
 
-| Field       | Required | Meaning                                                                  |
-| ----------- | -------- | ------------------------------------------------------------------------ |
-| `id`        | Yes      | Plugin-local ID matching `^[a-z][a-z0-9-]*$`.                            |
-| `title`     | Yes      | Non-empty label in the picker, the Open with menu, and Settings > Files. |
-| `icon`      | Yes      | Lucide name, `{ svg }`, or component. See [Icons](#icons).               |
-| `files`     | Yes      | `{ extensions: readonly string[]; filenames?: readonly string[] }`.      |
-| `Component` | Yes      | Component receiving `PluginFilePanelProps`.                              |
+| Field       | Required | Meaning                                                                                 |
+| ----------- | -------- | --------------------------------------------------------------------------------------- |
+| `id`        | Yes      | Plugin-local ID matching `^[a-z][a-z0-9-]*$`.                                           |
+| `title`     | Yes      | Non-empty label in the picker, the Open with menu, and Settings → Chat & panes → Files. |
+| `icon`      | Yes      | Lucide name, `{ svg }`, or component. See [Icons](#icons).                              |
+| `files`     | Yes      | `{ extensions: readonly string[]; filenames?: readonly string[] }`.                     |
+| `Component` | Yes      | Component receiving `PluginFilePanelProps`.                                             |
 
 Extensions have no leading dot and match without case sensitivity. Filenames match the exact
 basename, including case. Selectors contain no paths, globs, or wildcards. Use `extensions: []`
@@ -2092,7 +2275,7 @@ matches an exact filename, the choice applies to that basename instead. An unava
 is ignored on that host and retained for hosts where its panel is installed.
 
 Users choose a panel three ways: the picker on first open, **Open with…** in the tab menu, and
-**Settings > Files**. Open with switches the current tab and wins over the remembered association
+**Settings → Chat & panes → Files** (shown when a plugin registers a file panel). Open with switches the current tab and wins over the remembered association
 for this tab until it is retargeted; its **Always use** remembers the shown panel. Opening a file
 at a line, from a link or a search result, switches the tab to its built-in panel, which shows the
 line in its Source view. Files with no candidate show **Binary preview unavailable**; binary files

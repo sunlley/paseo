@@ -57,7 +57,7 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
-import { composeAgentSystemPrompt } from "../system-prompt.js";
+import { composeAgentSystemPrompt, composeSystemPromptParts } from "../system-prompt.js";
 import { CodexInstructionSnapshot } from "./codex/instruction-snapshot.js";
 import { CodexAsyncQuestions, codexAsyncQuestionToTimeline } from "./codex/async-questions.js";
 import {
@@ -70,6 +70,7 @@ import {
 } from "./codex/tool-call-mapper.js";
 import { normalizeCodexFilePath } from "./codex/tool-call-detail-parser.js";
 import {
+  buildProviderUsageLaunch,
   checkProviderLaunchAvailable,
   createProviderEnv,
   createProviderEnvSpec,
@@ -77,6 +78,7 @@ import {
   type ProviderRuntimeSettings,
   type ResolvedProviderLaunch,
 } from "../provider-launch-config.js";
+import { CODEX_USAGE_SOURCE_ID, readCodexRateLimitUsage } from "./codex/rate-limit-usage.js";
 import {
   findExecutable,
   probeExecutable,
@@ -341,6 +343,7 @@ interface CodexAppServerProcessPort {
 interface CodexAppServerAgentDeps {
   appServerProcess?: CodexAppServerProcessPort;
   environment?: Record<string, string>;
+  runtimeSettings?: ProviderRuntimeSettings;
   /** Where update checks learn the newest release; defaults to Codex's own release sources. */
   lookupLatestRelease?: LatestReleaseLookup;
   workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
@@ -2840,6 +2843,7 @@ type ParsedCodexNotification =
     }
   | { kind: "diff_updated"; diff: string; threadId: string | null }
   | { kind: "token_usage_updated"; tokenUsage: unknown; threadId: string | null }
+  | { kind: "rate_limits_updated"; rateLimits: unknown; threadId: null }
   | { kind: "agent_message_delta"; itemId: string; delta: string; threadId: string | null }
   | { kind: "reasoning_delta"; itemId: string; delta: string; threadId: string | null }
   | {
@@ -3513,6 +3517,25 @@ const CodexNotificationSchema = z.union([
     }),
   ),
   z
+    .object({
+      method: z.literal("account/rateLimits/updated"),
+      params: z.object({ rateLimits: z.unknown() }).passthrough(),
+    })
+    .transform(
+      ({ params }): ParsedCodexNotification => ({
+        kind: "rate_limits_updated",
+        rateLimits: params.rateLimits,
+        threadId: null,
+      }),
+    ),
+  z.object({ method: z.literal("account/rateLimits/updated"), params: z.unknown() }).transform(
+    ({ method, params }): ParsedCodexNotification => ({
+      kind: "invalid_payload",
+      method,
+      params,
+    }),
+  ),
+  z
     .object({ method: z.string(), params: z.unknown() })
     .transform(
       ({ method, params }): ParsedCodexNotification => ({ kind: "unknown_method", method, params }),
@@ -3797,6 +3820,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private resolvedWorkspaceWrite: NonNullable<
     CodexProviderOptions["sandbox_workspace_write"]
   > | null = null;
+  private configuredDeveloperInstructions: string | undefined;
   private resolvedSandboxPolicy: Record<string, unknown> | null = null;
   private currentThreadId: string | null = null;
   // Codex writes a new thread's rollout at its first turn. Until then the thread exists only
@@ -3925,6 +3949,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       provider: "codex",
       model: this.config.model,
       env: this.harnessEnvironment,
+      launch: buildProviderUsageLaunch("codex", this.deps.runtimeSettings, this.harnessEnvironment),
       sessionKey: this.usageSessionKey,
     };
   }
@@ -4062,7 +4087,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.speedModels =
         CodexModelListResponseSchema.parse(await client.request("model/list", {})).data ?? [];
       this.normalizeSpeed();
-      await this.loadResolvedWorkspaceWrite();
+      await this.loadResolvedConfig();
       await this.loadCollaborationModes();
       await this.loadSkills();
 
@@ -4093,7 +4118,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
   }
 
-  private async loadResolvedWorkspaceWrite(): Promise<void> {
+  private async loadResolvedConfig(): Promise<void> {
     if (!this.client) return;
     try {
       const response = toObjectRecord(
@@ -4101,9 +4126,23 @@ export class CodexAppServerAgentSession implements AgentSession {
       );
       const config = toObjectRecord(response?.config);
       this.resolvedWorkspaceWrite = readSandboxWorkspaceWrite(config?.sandbox_workspace_write);
+      this.configuredDeveloperInstructions =
+        typeof config?.developer_instructions === "string"
+          ? config.developer_instructions
+          : undefined;
     } catch (error) {
-      this.logger.debug({ error }, "Failed to read resolved Codex workspace-write config");
+      this.logger.debug({ error }, "Failed to read resolved Codex config");
     }
+  }
+
+  /**
+   * Codex uses a thread's developerInstructions in place of the developer_instructions in its
+   * config, so Paseo's instructions carry the configured ones ahead of them.
+   */
+  private threadDeveloperInstructions(): string | undefined {
+    const paseoInstructions = composeAgentSystemPrompt(this.config);
+    if (!paseoInstructions) return undefined;
+    return composeSystemPromptParts(this.configuredDeveloperInstructions, paseoInstructions);
   }
 
   private rememberResolvedSandboxPolicy(response: unknown): void {
@@ -4561,7 +4600,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       // the unnamespaced key emitted by earlier Paseo versions.
       params.modelProvider = this.deps.customCodexConfig.model_provider;
     }
-    const developerInstructions = composeAgentSystemPrompt(this.config);
+    const developerInstructions = this.threadDeveloperInstructions();
     if (developerInstructions) {
       params.developerInstructions = developerInstructions;
     }
@@ -5526,7 +5565,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       model: this.config.model ?? null,
       serviceTier: this.serviceTier,
       config: this.buildCodexInnerConfig(),
-      developerInstructions: composeAgentSystemPrompt(this.config),
+      developerInstructions: this.threadDeveloperInstructions(),
       userMessageTurns: this.codexUserMessageTurns(),
       threadRollbackAvailable: this.threadRollbackAvailable,
       setThreadId: async (threadId) => {
@@ -6082,7 +6121,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const approvalPolicy = this.hasWorkflowModeOverride ? preset.approvalPolicy : undefined;
     const sandbox = this.hasWorkflowModeOverride ? preset.sandbox : undefined;
     const innerConfig = this.buildCodexInnerConfig();
-    const developerInstructions = composeAgentSystemPrompt(this.config);
+    const developerInstructions = this.threadDeveloperInstructions();
     const params: Record<string, unknown> = {
       model,
       cwd: this.config.cwd ?? null,
@@ -6107,12 +6146,25 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.deps.customCodexConfig) {
       Object.assign(innerConfig, this.deps.customCodexConfig);
     }
-    if (this.config.mcpServers) {
-      const mcpServers: Record<string, CodexMcpServerConfig> = {};
-      for (const [name, serverConfig] of Object.entries(this.config.mcpServers)) {
-        mcpServers[name] = toCodexMcpConfig(serverConfig);
+    const mcpEntries = Object.entries(this.config.mcpServers ?? {});
+    if (mcpEntries.length > 0) {
+      // Emit per-server dotted overrides (`mcp_servers.<name>`) instead of a
+      // whole-table `mcp_servers` object so alias-level `-c mcp_servers.*` CLI
+      // overrides survive in Codex's `build_cli_overrides_layer`. Fall back to
+      // a whole table only when a server name contains `.`, which Codex's
+      // `path.split('.')` cannot address as a single segment.
+      const hasDottedServerName = mcpEntries.some(([name]) => name.includes("."));
+      if (hasDottedServerName) {
+        const mcpServers: Record<string, CodexMcpServerConfig> = {};
+        for (const [name, serverConfig] of mcpEntries) {
+          mcpServers[name] = toCodexMcpConfig(serverConfig);
+        }
+        innerConfig.mcp_servers = mcpServers;
+      } else {
+        for (const [name, serverConfig] of mcpEntries) {
+          innerConfig[`mcp_servers.${name}`] = toCodexMcpConfig(serverConfig);
+        }
       }
-      innerConfig.mcp_servers = mcpServers;
     }
     const configured = applyCodexToolPolicy(innerConfig, this.config.toolPolicy);
     return Object.keys(configured).length > 0 ? configured : null;
@@ -6308,6 +6360,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.handleThreadStateNotification(parsed)) {
       return;
     }
+    if (this.handleUsageNotification(parsed)) {
+      return;
+    }
     switch (parsed.kind) {
       case "thread_started":
         this.handleThreadStartedNotification(parsed);
@@ -6331,9 +6386,6 @@ export class CodexAppServerAgentSession implements AgentSession {
         // NOTE: Codex app-server emits frequent `turn/diff/updated` notifications
         // containing a full accumulated unified diff for the *entire turn*.
         // This is not a concrete file-change tool call; it is progress telemetry.
-        return;
-      case "token_usage_updated":
-        this.handleTokenUsageUpdatedNotification(parsed);
         return;
       case "exec_command_started":
         this.handleExecCommandStartedNotification(parsed);
@@ -7080,6 +7132,33 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.pendingAnonymousRootCompactions = 0;
     this.unpairedCompactionNotificationCompletions = 0;
     this.unpairedCompactionItemCompletions = 0;
+  }
+
+  private handleUsageNotification(parsed: ParsedCodexNotification): boolean {
+    if (parsed.kind === "token_usage_updated") {
+      this.handleTokenUsageUpdatedNotification(parsed);
+      return true;
+    }
+    if (parsed.kind === "rate_limits_updated") {
+      this.handleRateLimitsUpdatedNotification(parsed);
+      return true;
+    }
+    return false;
+  }
+
+  private handleRateLimitsUpdatedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "rate_limits_updated" }>,
+  ): void {
+    const observed = readCodexRateLimitUsage(parsed.rateLimits);
+    if (!observed || (observed.windows.length === 0 && observed.balances.length === 0)) return;
+    this.emitEvent({
+      type: "usage_observed",
+      provider: CODEX_PROVIDER,
+      sourceId: CODEX_USAGE_SOURCE_ID,
+      windows: observed.windows,
+      ...(observed.balances.length > 0 ? { balances: observed.balances } : {}),
+      ...(observed.planLabel ? { planLabel: observed.planLabel } : {}),
+    });
   }
 
   private handlePlanUpdatedNotification(
@@ -8189,9 +8268,18 @@ export class CodexAppServerAgentClient implements AgentClient {
     };
   }
 
+  async resolveUsageLaunch() {
+    return buildProviderUsageLaunch(
+      "codex",
+      this.runtimeSettings,
+      buildCodexAppServerEnv(this.runtimeSettings),
+    );
+  }
+
   private sessionDeps(launchEnv: Record<string, string> | undefined): CodexAppServerAgentDeps {
     return {
       ...this.deps,
+      runtimeSettings: this.runtimeSettings,
       codexHome: resolveCodexHomeDir(buildCodexAppServerEnv(this.runtimeSettings, launchEnv)),
       customCodexConfig: this.customProviderConfig(),
     };
@@ -8257,6 +8345,7 @@ export class CodexAppServerAgentClient implements AgentClient {
     environment: Record<string, string>;
     goalsEnabled?: boolean;
     agentId?: string;
+    wrap?: AgentLaunchContext["wrap"];
   }): Promise<() => ChildProcessWithoutNullStreams> {
     const processPort = this.deps.appServerProcess ?? defaultCodexAppServerProcess;
     const launchPrefix = await processPort.resolvePrefix({ runtimeSettings: this.runtimeSettings });
@@ -8270,14 +8359,17 @@ export class CodexAppServerAgentClient implements AgentClient {
           agentId: options.agentId,
           provider: CODEX_PROVIDER,
           launchPrefix,
+          wrap: options.wrap,
           goalsEnabled: options.goalsEnabled === true,
         },
         "provider.codex.spawn",
       );
+      // Every spawn from this closure, including reconnects and startup retries, carries the wrap.
       const child = processPort.spawn({
         command: launchPrefix.command,
         args,
         options: {
+          wrap: options.wrap,
           detached: process.platform !== "win32",
           stdio: ["pipe", "pipe", "pipe"],
           baseEnv: options.environment,
@@ -8324,6 +8416,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       environment,
       goalsEnabled,
       agentId: launchContext?.agentId,
+      wrap: launchContext?.wrap,
     });
     const session = new CodexAppServerAgentSession(
       sessionConfig,
@@ -8361,6 +8454,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       environment,
       goalsEnabled,
       agentId: launchContext?.agentId,
+      wrap: launchContext?.wrap,
     });
     const session = new CodexAppServerAgentSession(
       merged,
