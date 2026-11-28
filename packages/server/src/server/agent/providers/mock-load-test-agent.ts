@@ -460,6 +460,25 @@ function parseLargeAgentStreamPayloadPrompt(
   };
 }
 
+/**
+ * A reply whose code blocks close in two arrivals: one backtick, a pause, then
+ * the other two. Providers and the daemon's coalescing window can end a delta
+ * anywhere, so this is the deterministic version of a closing fence that is
+ * still being typed when a frame paints.
+ */
+const SPLIT_CLOSING_FENCE_PAUSE_MS = 800;
+const SPLIT_CLOSING_FENCE_CHUNKS: ReadonlyArray<{ text: string; pauseMs?: number }> = [
+  { text: "Here is the first snippet:\n\n```ts\nconst answer = 42;\nconsole.log(answer);\n" },
+  { text: "`", pauseMs: SPLIT_CLOSING_FENCE_PAUSE_MS },
+  { text: "``\n\nAnd a second one:\n\n```sh\necho done\n" },
+  { text: "`", pauseMs: SPLIT_CLOSING_FENCE_PAUSE_MS },
+  { text: "``\n\nBoth blocks are closed." },
+];
+
+function isSplitClosingFencePrompt(prompt: AgentPromptInput): boolean {
+  return /stream a code block with a split closing fence/i.test(promptToText(prompt));
+}
+
 function parseAgentStreamStressPrompt(prompt: AgentPromptInput): AgentStreamStressRequest | null {
   const text = promptToText(prompt);
   const match = /emit\s+(\d+)\s+(coalesced\s+|tool\s+)?agent stream updates/i.exec(text);
@@ -715,6 +734,7 @@ function createToolCall(input: {
 export class MockLoadTestAgentClient implements AgentClient {
   readonly provider: AgentProvider = MOCK_LOAD_TEST_PROVIDER_ID;
   readonly capabilities = CAPABILITIES;
+  private readonly sessionHistories = new Map<string, AgentStreamEvent[]>();
 
   constructor(private readonly logger?: Logger) {}
 
@@ -722,9 +742,13 @@ export class MockLoadTestAgentClient implements AgentClient {
     config: AgentSessionConfig,
     _launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    const sessionId = randomUUID();
+    const history: AgentStreamEvent[] = [];
+    this.sessionHistories.set(sessionId, history);
     return new MockLoadTestAgentSession({
       config,
-      sessionId: randomUUID(),
+      sessionId,
+      history,
       logger: this.logger,
     });
   }
@@ -735,6 +759,11 @@ export class MockLoadTestAgentClient implements AgentClient {
     _launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
     const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
+    let history = this.sessionHistories.get(handle.sessionId);
+    if (!history) {
+      history = [];
+      this.sessionHistories.set(handle.sessionId, history);
+    }
     return new MockLoadTestAgentSession({
       config: {
         cwd: metadata.cwd ?? overrides?.cwd ?? process.cwd(),
@@ -743,6 +772,7 @@ export class MockLoadTestAgentClient implements AgentClient {
         provider: MOCK_LOAD_TEST_PROVIDER_ID,
       },
       sessionId: handle.sessionId,
+      history,
       logger: this.logger,
     });
   }
@@ -792,7 +822,7 @@ export class MockLoadTestAgentSession implements AgentSession {
   private readonly usageSessionKey = randomUUID();
 
   private readonly listeners = new Set<(event: AgentStreamEvent) => void>();
-  private readonly history: AgentStreamEvent[] = [];
+  private readonly history: AgentStreamEvent[];
   private readonly logger?: Logger;
   private activeTurn: ActiveTurn | null = null;
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
@@ -806,8 +836,14 @@ export class MockLoadTestAgentSession implements AgentSession {
   private remainingPromptRejections: number;
   private remainingSteerFailures: number;
 
-  constructor(options: { config: AgentSessionConfig; sessionId: string; logger?: Logger }) {
+  constructor(options: {
+    config: AgentSessionConfig;
+    sessionId: string;
+    history?: AgentStreamEvent[];
+    logger?: Logger;
+  }) {
     this.id = options.sessionId;
+    this.history = options.history ?? [];
     this.logger = options.logger;
     this.modeId = options.config.modeId ?? MOCK_LOAD_TEST_MODE_ID;
     this.modelId = options.config.model ?? MOCK_LOAD_TEST_DEFAULT_MODEL_ID;
@@ -903,6 +939,7 @@ export class MockLoadTestAgentSession implements AgentSession {
     this.activeTurn = turn;
     const largePayload = parseLargeAgentStreamPayloadPrompt(prompt);
     const stress = parseAgentStreamStressPrompt(prompt);
+    const splitClosingFence = isSplitClosingFencePrompt(prompt);
     const questionPrompt = parseMockQuestionPrompt(prompt);
     const structuredBranchName = parseStructuredBranchNamePrompt(prompt);
     const settledAssistantImageMarkdown = parseSettledAssistantImageMarkdown(prompt);
@@ -931,6 +968,8 @@ export class MockLoadTestAgentSession implements AgentSession {
         this.scheduleLargePayloadTurn(turn, largePayload);
       } else if (stress) {
         this.scheduleStressTurn(turn, stress);
+      } else if (splitClosingFence) {
+        this.scheduleSplitClosingFenceTurn(turn);
       } else {
         this.schedule(turn, 0);
       }
@@ -1266,6 +1305,33 @@ export class MockLoadTestAgentSession implements AgentSession {
       }, 5_000);
       turn.timer.unref?.();
     }, 0);
+    turn.timer.unref?.();
+  }
+
+  private scheduleSplitClosingFenceTurn(turn: ActiveTurn): void {
+    const chunks = [...SPLIT_CLOSING_FENCE_CHUNKS];
+    const finalText = chunks.map((chunk) => chunk.text).join("");
+    const emitNext = () => {
+      if (this.activeTurn !== turn) {
+        return;
+      }
+      this.clearTurnTimer(turn);
+      this.emitTurnStarted(turn);
+      const chunk = chunks.shift();
+      if (chunk === undefined) {
+        this.finishTurnWithText(turn, finalText);
+        return;
+      }
+      turn.emittedTokens += 1;
+      this.emitTimeline(turn.turnId, {
+        type: "assistant_message",
+        text: chunk.text,
+        messageId: turn.assistantMessageId,
+      });
+      turn.timer = setTimeout(emitNext, chunk.pauseMs ?? this.streamingAssistantIntervalMs);
+      turn.timer.unref?.();
+    };
+    turn.timer = setTimeout(emitNext, 0);
     turn.timer.unref?.();
   }
 

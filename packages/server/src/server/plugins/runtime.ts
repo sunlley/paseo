@@ -1,7 +1,7 @@
 import { validateWorktreePath } from "../../utils/worktree-path.js";
 import type { PluginHookPayload } from "@getpaseo/plugin/server";
-import type { PluginWireBeforeRequests, PluginBeforeResults } from "./lifecycle/index.js";
-import type { SessionOpenWireRequest, AttachedAgentTool } from "./agent-tools.js";
+import type { PluginLifecycleBeforeName, PluginWireBeforeRequests } from "./lifecycle/index.js";
+import { SessionAttachments, type SessionOpenPlugin } from "./session-attachments.js";
 import type { UsageScope } from "@getpaseo/plugin/server/usage";
 import {
   ProviderInspectionSchema,
@@ -25,6 +25,9 @@ import type {
   PluginWorktreeCreateInput,
   PluginWorktreeRemoveRequest,
   PluginWorktreeRestoreRequest,
+  TunnelEvent,
+  TunnelProviderStatus,
+  TunnelTarget,
 } from "@getpaseo/plugin/server";
 import { z } from "zod";
 import { validateBeforeRequest, validateBeforeResult } from "./lifecycle/index.js";
@@ -49,10 +52,14 @@ import type {
   PluginProcessMessage,
   PluginProcessRequest,
   PluginProviderMetadata,
+  PluginTunnelProviderMetadata,
   PluginUsageSourceMetadata,
   PluginWorktreeManagerCapabilities,
 } from "./plugin-process-protocol.js";
-import { PluginProcessMessageSchema } from "./plugin-process-protocol.js";
+import {
+  PluginProcessMessageSchema,
+  TunnelProviderStatusSchema,
+} from "./plugin-process-protocol.js";
 import {
   BufferedPluginSubscription,
   type PluginRuntimeSubscription,
@@ -60,6 +67,7 @@ import {
 import { PluginSessionSocket } from "./session-socket.js";
 import { InternalPluginChild } from "./internal-child.js";
 import { evaluateBundle } from "./bundle-evaluator.js";
+import { PluginNotificationDispatcher, type ValidatedPluginNotification } from "./notifications.js";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const WORKTREE_MANAGER_TIMEOUT_MS = 120_000;
@@ -147,11 +155,13 @@ interface LoadedPlugin {
   worktreeManager: PluginWorktreeManagerCapabilities | null;
   providers: readonly PluginProviderMetadata[];
   usageSources: readonly PluginUsageSourceMetadata[];
+  tunnelProviders: readonly PluginTunnelProviderMetadata[];
   child: PluginChild | null;
   outputCapture: PluginOutputCapture | null;
   pending: Map<string, PendingInvocation>;
   providerConnections: Map<string, RemoteProviderConnection>;
   providerConnectionTombstones: Set<string>;
+  tunnelExposures: Map<string, RemoteTunnelExposure>;
   sessionSocket: PluginSessionSocket | null;
   sessionClosed: Promise<void> | null;
 }
@@ -193,9 +203,18 @@ interface RemoteProviderConnection {
   rejectClosed(error: Error): void;
 }
 
+interface RemoteTunnelExposure {
+  onEvent(event: TunnelEvent): void;
+  onClosed(error?: string): void;
+  closed: boolean;
+  closedPromise: Promise<void>;
+  resolveClosed(): void;
+}
+
 interface PluginRuntimeDependencies {
   settingsDirectory?: string;
   onSettingsChanged?: (pluginId: string, settingsId: string) => void;
+  onTunnelProvidersChanged?: (pluginId: string) => void;
   spawnChild?: () => PluginChild;
   sessionHost?: PluginPaseoSessionHost;
 }
@@ -278,6 +297,7 @@ export interface PluginPaseoSessionHost {
     pluginId: string,
     socket: PluginSessionSocket,
   ): Promise<{ closed: Promise<void> }>;
+  sendPluginNotification?(notification: ValidatedPluginNotification): void | Promise<void>;
 }
 
 function resolveWorkerUrl(): URL {
@@ -374,7 +394,9 @@ export class PluginRuntime {
   private readonly spawnChild: () => PluginChild;
   private sessionHost: PluginPaseoSessionHost | null;
   private readonly listeners = new Set<(pluginId: string, error?: string) => void>();
-  private readonly sessionOpenListeners = new Set<() => void>();
+  private readonly notifications: PluginNotificationDispatcher;
+  /** What `agent.open.before` plugins attached to each live session. */
+  readonly sessionAttachments: SessionAttachments;
 
   constructor(
     logger: pino.Logger,
@@ -384,6 +406,16 @@ export class PluginRuntime {
     this.logger = logger.child({ module: "plugins" });
     this.spawnChild = dependencies.spawnChild ?? spawnPluginChild;
     this.sessionHost = dependencies.sessionHost ?? null;
+    this.notifications = new PluginNotificationDispatcher({
+      deliver: (notification) => this.sessionHost?.sendPluginNotification?.(notification),
+    });
+    this.sessionAttachments = new SessionAttachments(
+      {
+        sessionOpenPlugins: () => this.sessionOpenPlugins(),
+        detachEverywhere: (agentId) => this.detachTools(agentId),
+      },
+      this.logger,
+    );
   }
 
   bindPaseoSessionHost(sessionHost: PluginPaseoSessionHost): void {
@@ -395,16 +427,6 @@ export class PluginRuntime {
   subscribe(listener: (pluginId: string, error?: string) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
-  }
-
-  subscribeSessionOpenChanges(listener: () => void): () => void {
-    this.sessionOpenListeners.add(listener);
-    return () => this.sessionOpenListeners.delete(listener);
-  }
-
-  private notifySessionOpenChange(loaded: LoadedPlugin): void {
-    if (!loaded.hooks.includes("agent.open.before")) return;
-    for (const listener of this.sessionOpenListeners) listener();
   }
 
   async startPlugin(
@@ -429,7 +451,6 @@ export class PluginRuntime {
       throw new Error(`Plugin start cancelled: ${pluginId}`);
     }
     this.plugins.set(pluginId, loaded);
-    this.notifySessionOpenChange(loaded);
     this.appendLog(pluginId, "stdout", "[paseo] Plugin ready");
   }
 
@@ -449,7 +470,6 @@ export class PluginRuntime {
       clientBundle: bundles.clientBundle ?? "",
     });
     this.plugins.set(input.id, loaded);
-    this.notifySessionOpenChange(loaded);
     this.appendLog(input.id, "stdout", "[paseo] Plugin ready");
   }
 
@@ -461,7 +481,7 @@ export class PluginRuntime {
     const loaded = this.plugins.get(pluginId);
     if (!loaded) return false;
     this.plugins.delete(pluginId);
-    this.notifySessionOpenChange(loaded);
+    this.notifications.clearPlugin(pluginId);
     this.rejectPending(loaded, `Plugin stopped: ${pluginId}`);
     await this.stopPlugin(loaded);
     return true;
@@ -489,6 +509,101 @@ export class PluginRuntime {
 
   getUsageSourceRegistrations(pluginId: string): readonly PluginUsageSourceMetadata[] {
     return this.plugins.get(pluginId)?.usageSources ?? [];
+  }
+
+  getTunnelProviderRegistrations(pluginId: string): readonly PluginTunnelProviderMetadata[] {
+    return this.plugins.get(pluginId)?.tunnelProviders ?? [];
+  }
+
+  async getTunnelProviderStatus(
+    pluginId: string,
+    providerId: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<TunnelProviderStatus> {
+    const loaded = this.plugins.get(pluginId);
+    if (!loaded) throw new Error(`Plugin is not available: ${pluginId}`);
+    if (!loaded.tunnelProviders.some((provider) => provider.id === providerId)) {
+      throw new Error(`Plugin ${pluginId} does not contribute tunnel provider ${providerId}`);
+    }
+    return TunnelProviderStatusSchema.parse(
+      await this.request(
+        loaded,
+        { type: "tunnel.status", requestId: randomUUID(), providerId },
+        { signal: options?.signal },
+      ),
+    );
+  }
+
+  openTunnel(
+    pluginId: string,
+    providerId: string,
+    exposureId: string,
+    target: TunnelTarget,
+    callbacks: {
+      onEvent(event: TunnelEvent): void;
+      onClosed(error?: string): void;
+    },
+  ): { close(): Promise<void> } {
+    const loaded = this.plugins.get(pluginId);
+    if (!loaded?.child) throw new Error(`Plugin is not available: ${pluginId}`);
+    if (!loaded.tunnelProviders.some((provider) => provider.id === providerId)) {
+      throw new Error(`Plugin ${pluginId} does not contribute tunnel provider ${providerId}`);
+    }
+    if (loaded.tunnelExposures.has(exposureId)) {
+      throw new Error(`Duplicate tunnel exposure: ${exposureId}`);
+    }
+    let resolveClosed!: () => void;
+    const closedPromise = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    const state: RemoteTunnelExposure = {
+      onEvent: callbacks.onEvent,
+      onClosed: callbacks.onClosed,
+      closed: false,
+      closedPromise,
+      resolveClosed,
+    };
+    const finish = (error?: string) => {
+      if (state.closed) return;
+      state.closed = true;
+      loaded.tunnelExposures.delete(exposureId);
+      state.resolveClosed();
+      state.onClosed(error);
+    };
+    loaded.tunnelExposures.set(exposureId, state);
+    void send(loaded.child, {
+      type: "tunnel.open",
+      exposureId,
+      providerId,
+      target,
+    }).catch((error) => {
+      finish(describeError(error));
+    });
+    return {
+      close: async () => {
+        if (state.closed) return;
+        if (loaded.child?.connected) {
+          await send(loaded.child, { type: "tunnel.close", exposureId }).catch(() => undefined);
+        } else {
+          finish();
+          return;
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            state.closedPromise,
+            new Promise<void>((resolve) => {
+              timer = setTimeout(() => {
+                finish();
+                resolve();
+              }, 5_000);
+            }),
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      },
+    };
   }
 
   fetchUsage(pluginId: string, sourceId: string, input: unknown): Promise<unknown> {
@@ -752,17 +867,14 @@ export class PluginRuntime {
     }
   }
 
-  async before<Name extends keyof PluginWireBeforeRequests>(
+  async before<Name extends PluginLifecycleBeforeName>(
     name: Name,
     input: PluginWireBeforeRequests[Name],
-  ): Promise<PluginBeforeResults[Name]> {
+  ): Promise<PluginWireBeforeRequests[Name]> {
     let request = validateBeforeRequest(name, input);
     const plugins = [...this.plugins.values()].sort((left, right) => {
       return left.id.localeCompare(right.id);
     });
-    const attached: AttachedAgentTool[] = [];
-    const mcpServers: SessionOpenWireRequest["mcpServers"] = {};
-    const mcpServerOwners: Record<string, string> = {};
     for (const loaded of plugins) {
       if (!loaded.hooks.includes(name)) {
         continue;
@@ -772,7 +884,7 @@ export class PluginRuntime {
           type: "hook",
           requestId: randomUUID(),
           name,
-          input: name === "agent.open.before" ? { ...request, tools: [], mcpServers: {} } : request,
+          input: request,
         });
         request = await validateBeforeResult(name, request, output);
         if (name === "worktree.create.before") {
@@ -782,26 +894,11 @@ export class PluginRuntime {
             repoPath: worktree.repoRoot,
           });
         }
-        if (name === "agent.open.before") {
-          const opened = request as SessionOpenWireRequest;
-          this.collectMcpServers(mcpServers, mcpServerOwners, loaded, opened.mcpServers);
-          this.collectAgentTools(attached, loaded, opened.tools);
-        }
       } catch (error) {
-        if (name === "agent.open.before")
-          this.detachTools((request as SessionOpenWireRequest).agentId);
         throw new Error(`Plugin ${loaded.id} ${name} failed: ${describeError(error)}`, {
           cause: error,
         });
       }
-    }
-    if (name === "agent.open.before") {
-      return {
-        ...request,
-        tools: attached,
-        mcpServers,
-        mcpServerOwners,
-      } as PluginBeforeResults[Name];
     }
     return request;
   }
@@ -927,43 +1024,34 @@ export class PluginRuntime {
     return output;
   }
 
-  private collectMcpServers(
-    servers: SessionOpenWireRequest["mcpServers"],
-    owners: Record<string, string>,
-    loaded: LoadedPlugin,
-    contributions: SessionOpenWireRequest["mcpServers"],
-  ): void {
-    for (const [name, server] of Object.entries(contributions)) {
-      if (Object.hasOwn(servers, name)) {
-        throw new Error(
-          `MCP server ${name} from plugin ${loaded.id} collides with plugin ${owners[name]}`,
-        );
-      }
-      servers[name] = server;
-      owners[name] = loaded.id;
-    }
-  }
-
-  private collectAgentTools(
-    attached: AttachedAgentTool[],
-    loaded: LoadedPlugin,
-    tools: SessionOpenWireRequest["tools"],
-  ): void {
-    for (const tool of tools) {
-      const collision = attached.find((entry) => entry.name === tool.name);
-      if (collision)
-        throw new Error(
-          `Agent tool ${tool.name} from plugin ${loaded.id} collides with plugin ${collision.pluginId}`,
-        );
-      attached.push({ ...tool, pluginId: loaded.id, pluginInstanceId: loaded.instanceId });
-    }
-  }
-
   isToolPluginAvailable(pluginId: string, pluginInstanceId: string): boolean {
     return this.plugins.get(pluginId)?.instanceId === pluginInstanceId;
   }
 
-  detachTools(agentId: string): void {
+  private sessionOpenPlugins(): SessionOpenPlugin[] {
+    return [...this.plugins.values()]
+      .filter((loaded) => loaded.child && loaded.hooks.includes("agent.open.before"))
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((loaded) => ({
+        id: loaded.id,
+        instanceId: loaded.instanceId,
+        open: async (input) => {
+          const output = await this.request(loaded, {
+            type: "hook",
+            requestId: randomUUID(),
+            name: "agent.open.before",
+            input,
+          });
+          return validateBeforeResult("agent.open.before", input, output);
+        },
+        detach: (agentId) => {
+          if (loaded.child)
+            void send(loaded.child, { type: "tools.detach", agentId }).catch(() => {});
+        },
+      }));
+  }
+
+  private detachTools(agentId: string): void {
     for (const loaded of this.plugins.values()) {
       if (loaded.child) void send(loaded.child, { type: "tools.detach", agentId }).catch(() => {});
     }
@@ -1014,6 +1102,8 @@ export class PluginRuntime {
           void send(child, { type: "worktree.cancel", requestId }).catch(() => {});
         if (isInstallationRequest(message))
           void send(child, { type: "provider.installation.cancel", requestId }).catch(() => {});
+        if (message.type === "tunnel.status")
+          void send(child, { type: "tunnel.status.cancel", requestId }).catch(() => {});
         signal?.removeEventListener("abort", cancel);
         reject(signal?.reason ?? new Error("Plugin request canceled"));
       };
@@ -1041,6 +1131,8 @@ export class PluginRuntime {
                 void send(child, { type: "provider.installation.cancel", requestId }).catch(
                   () => {},
                 );
+              if (message.type === "tunnel.status")
+                void send(child, { type: "tunnel.status.cancel", requestId }).catch(() => {});
               reject(new Error(`Plugin RPC timed out: ${pluginId}.${message.type}`));
             }, timeoutMs);
       signal?.addEventListener("abort", cancel, { once: true });
@@ -1068,8 +1160,8 @@ export class PluginRuntime {
   async stopAll(): Promise<void> {
     const loaded = [...this.plugins.values()];
     this.plugins.clear();
+    this.notifications.clearAll();
     for (const plugin of loaded) {
-      this.notifySessionOpenChange(plugin);
       this.rejectPending(plugin, `Plugin stopped: ${plugin.id}`);
     }
     await Promise.all(loaded.map((plugin) => this.stopPlugin(plugin)));
@@ -1100,11 +1192,13 @@ export class PluginRuntime {
         worktreeManager: null,
         providers: [],
         usageSources: [],
+        tunnelProviders: [],
         child: null,
         outputCapture: null,
         pending: new Map(),
         providerConnections: new Map(),
         providerConnectionTombstones: new Set(),
+        tunnelExposures: new Map(),
         sessionSocket: null,
         sessionClosed: null,
       };
@@ -1233,11 +1327,13 @@ export class PluginRuntime {
       worktreeManager: ready.worktreeManager ?? null,
       providers: ready.providers ?? [],
       usageSources: ready.usageSources ?? [],
+      tunnelProviders: ready.tunnelProviders ?? [],
       child,
       outputCapture,
       pending,
       providerConnections: new Map(),
       providerConnectionTombstones: new Set(),
+      tunnelExposures: new Map(),
       sessionSocket: session.socket,
       sessionClosed: sessionAttachment.closed,
     };
@@ -1310,20 +1406,14 @@ export class PluginRuntime {
 
   private handleChildMessage(loaded: LoadedPlugin, message: PluginProcessMessage): void {
     if (message.type === "hooks.changed") {
-      const hadSessionOpen = loaded.hooks.includes("agent.open.before");
       loaded.hooks = message.hooks;
-      if (
-        this.plugins.get(loaded.id) === loaded &&
-        hadSessionOpen !== loaded.hooks.includes("agent.open.before")
-      ) {
-        for (const listener of this.sessionOpenListeners) listener();
-      }
       return;
     }
     if (message.type === "worktree_manager.changed") {
       loaded.worktreeManager = message.worktreeManager;
       return;
     }
+    if (this.handleTunnelMessage(loaded, message)) return;
     if (message.type === "settings.changed") {
       this.dependencies.onSettingsChanged?.(loaded.id, message.settingsId);
       return;
@@ -1346,6 +1436,10 @@ export class PluginRuntime {
       subscription?.closed(message.error);
       return;
     }
+    if (message.type === "notification.send") {
+      void this.handleNotificationSend(loaded, message);
+      return;
+    }
     if (message.type !== "result" && message.type !== "error") return;
     const pending = loaded.pending.get(message.requestId);
     if (!pending) return;
@@ -1353,6 +1447,54 @@ export class PluginRuntime {
     clearTimeout(pending.timeout);
     if (message.type === "result") pending.resolve(message.output);
     else pending.reject(new Error(message.error));
+  }
+
+  private handleTunnelMessage(loaded: LoadedPlugin, message: PluginProcessMessage): boolean {
+    if (message.type === "tunnel_providers.changed") {
+      loaded.tunnelProviders = message.tunnelProviders;
+      this.dependencies.onTunnelProvidersChanged?.(loaded.id);
+      return true;
+    }
+    if (message.type === "tunnel.event") {
+      const exposure = loaded.tunnelExposures.get(message.exposureId);
+      if (exposure && !exposure.closed) exposure.onEvent(message.event);
+      return true;
+    }
+    if (message.type === "tunnel.closed") {
+      const exposure = loaded.tunnelExposures.get(message.exposureId);
+      if (exposure && !exposure.closed) {
+        exposure.closed = true;
+        loaded.tunnelExposures.delete(message.exposureId);
+        exposure.resolveClosed();
+        exposure.onClosed(message.error);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private async handleNotificationSend(
+    loaded: LoadedPlugin,
+    message: Extract<PluginProcessMessage, { type: "notification.send" }>,
+  ): Promise<void> {
+    try {
+      const result = await this.notifications.dispatch(loaded.id, message.input);
+      if (loaded.child?.connected) {
+        await send(loaded.child, {
+          type: "notification.result",
+          requestId: message.requestId,
+          result,
+        }).catch(() => undefined);
+      }
+    } catch (error) {
+      if (loaded.child?.connected) {
+        await send(loaded.child, {
+          type: "notification.error",
+          requestId: message.requestId,
+          error: describeError(error),
+        }).catch(() => undefined);
+      }
+    }
   }
 
   private handleProviderMessage(loaded: LoadedPlugin, message: PluginProcessMessage): void {
@@ -1649,13 +1791,21 @@ export class PluginRuntime {
     const wasPublished = this.plugins.get(loaded.id) === loaded;
     if (wasPublished) {
       this.plugins.delete(loaded.id);
-      this.notifySessionOpenChange(loaded);
     }
+    this.notifications.clearPlugin(loaded.id);
     this.rejectPending(loaded, `Plugin process exited: ${loaded.id}`);
     for (const state of loaded.providerConnections.values()) {
       this.failRemoteProviderConnection(state, new Error(`Plugin process exited: ${loaded.id}`));
     }
     loaded.providerConnections.clear();
+    const exposures = [...loaded.tunnelExposures.values()];
+    loaded.tunnelExposures.clear();
+    for (const exposure of exposures) {
+      if (exposure.closed) continue;
+      exposure.closed = true;
+      exposure.resolveClosed();
+      exposure.onClosed(`Plugin process exited: ${loaded.id}`);
+    }
     await loaded.sessionClosed;
     if (wasPublished) this.notify(loaded.id, `Plugin process exited: ${loaded.id}`);
   }

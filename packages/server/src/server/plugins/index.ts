@@ -1,4 +1,4 @@
-import type { PluginAgentToolsRuntime } from "./agent-tools.js";
+import type { PluginSessionsRuntime } from "./agent-tools.js";
 import type { PluginLifecycle } from "./lifecycle/index.js";
 import path from "node:path";
 import { stat, rm } from "node:fs/promises";
@@ -30,22 +30,25 @@ import { BuiltinPluginLoader, type BuiltinPlugin } from "./builtin/index.js";
 import type {
   PluginProviderInstallationMetadata,
   PluginProviderMetadata,
+  PluginTunnelProviderMetadata,
+  PluginUsageSourceMetadata,
 } from "./plugin-process-protocol.js";
+import type { RegisteredTunnelProvider, TunnelManager } from "../tunnels/index.js";
 import { readPluginProviderIcon } from "./provider-icon.js";
 import {
   type AgentUsageLookup,
   type ListUsageReportsOptions,
+  type UsageObservation,
   UsageSourceRegistry,
 } from "./usage-sources/index.js";
-import type { PluginUsageSourceMetadata } from "./plugin-process-protocol.js";
+import type { UsageReportEntry } from "@getpaseo/protocol/messages";
 
 const BUILTIN_PROVIDER_ID_SET: ReadonlySet<string> = new Set(BUILTIN_PROVIDER_IDS);
 
 interface PluginRuntimePort {
-  subscribeSessionOpenChanges?: PluginRuntime["subscribeSessionOpenChanges"];
+  sessionAttachments?: PluginRuntime["sessionAttachments"];
   isToolPluginAvailable?: PluginRuntime["isToolPluginAvailable"];
   callTool?: PluginRuntime["callTool"];
-  detachTools?: PluginRuntime["detachTools"];
   emit?: PluginLifecycle["emit"];
   drainEvents?: PluginRuntime["drainEvents"];
   before?: PluginLifecycle["before"];
@@ -61,6 +64,9 @@ interface PluginRuntimePort {
   clearLogs(pluginId: string): void;
   getProviderRegistrations?(pluginId: string): readonly PluginProviderMetadata[];
   getUsageSourceRegistrations(pluginId: string): readonly PluginUsageSourceMetadata[];
+  getTunnelProviderRegistrations?(pluginId: string): readonly PluginTunnelProviderMetadata[];
+  getTunnelProviderStatus?: PluginRuntime["getTunnelProviderStatus"];
+  openTunnel?: PluginRuntime["openTunnel"];
   fetchUsage: PluginRuntime["fetchUsage"];
   discoverUsage: PluginRuntime["discoverUsage"];
   connectProvider: PluginRuntime["connectProvider"];
@@ -80,6 +86,7 @@ interface PluginRuntimePort {
 
 interface PluginServiceDependencies {
   usageAgents?: AgentUsageLookup;
+  tunnelManager?: TunnelManager;
   settingsDirectory?: string;
   runtime?: PluginRuntimePort;
   managedSources?: ManagedPluginSources;
@@ -102,10 +109,17 @@ export class PluginService {
   private readonly builtinPlugins: BuiltinPluginLoader;
   private readonly logger: pino.Logger;
   private readonly errors = new Map<string, string>();
+  /**
+   * Restarts in progress. A restart stops the plugin before its replacement starts; a session refresh waits for it,
+   * so the gap never reads as the plugin's removal. A restart that fails to start reads as one.
+   */
+  private readonly restarts = new Set<Promise<void>>();
   private readonly listeners = new Set<(pluginId: string) => void>();
   private readonly providers = new Map<string, ProviderRegistration>();
   private readonly usageSources: UsageSourceRegistry;
   private readonly usageSourceIdsByPlugin = new Map<string, string[]>();
+  private readonly tunnelManager: TunnelManager | null;
+  private readonly tunnelProviderIdsByPlugin = new Map<string, string[]>();
   private readonly providerIdsByPlugin = new Map<string, readonly string[]>();
   private readonly providerListeners = new Set<() => void>();
   private lifecycle = Promise.resolve();
@@ -130,12 +144,21 @@ export class PluginService {
       this.logger,
       dependencies.usageAgents,
     );
+    this.tunnelManager = dependencies.tunnelManager ?? null;
     this.runtime =
       dependencies.runtime ??
       new PluginRuntime(logger, daemonVersion, {
         settingsDirectory: dependencies.settingsDirectory,
         onSettingsChanged: (pluginId, settingsId) => {
           for (const listener of this.settingsListeners) listener(pluginId, settingsId);
+        },
+        onTunnelProvidersChanged: (pluginId) => {
+          void this.syncTunnelProviders(pluginId).catch((error) => {
+            this.logger.warn(
+              { err: error, pluginId },
+              "Failed to synchronize plugin tunnel providers",
+            );
+          });
         },
       });
     this.managedSources = dependencies.managedSources ?? null;
@@ -144,6 +167,7 @@ export class PluginService {
     this.runtime.subscribe((pluginId, error) => {
       this.removeProviderRegistrations(pluginId);
       this.removeUsageSources(pluginId);
+      void this.removeTunnelProviders(pluginId);
       if (error) this.errors.set(pluginId, error);
       this.notify(pluginId);
     });
@@ -153,22 +177,33 @@ export class PluginService {
     this.runtime.emit?.(name, event);
   };
 
-  subscribeSessionOpenChanges(listener: () => void): () => void {
-    return this.runtime.subscribeSessionOpenChanges?.(listener) ?? (() => {});
-  }
-
-  readonly isToolPluginAvailable: PluginAgentToolsRuntime["isToolPluginAvailable"] = (
-    pluginId,
-    pluginInstanceId,
-  ) => {
-    return this.runtime.isToolPluginAvailable?.(pluginId, pluginInstanceId) ?? false;
+  readonly openSession: PluginSessionsRuntime["openSession"] = async (request) => {
+    if (this.runtime.sessionAttachments) return this.runtime.sessionAttachments.open(request);
+    return { ...request, tools: [], mcpServers: {}, mcpServerOwners: {} };
   };
 
-  readonly detachTools: PluginAgentToolsRuntime["detachTools"] = (agentId) => {
-    this.runtime.detachTools?.(agentId);
+  readonly sessionLaunched: PluginSessionsRuntime["sessionLaunched"] = (agentId) => {
+    this.runtime.sessionAttachments?.launched(agentId);
   };
 
-  readonly callTool: PluginAgentToolsRuntime["callTool"] = async (
+  readonly sessionLaunchFailed: PluginSessionsRuntime["sessionLaunchFailed"] = (agentId) => {
+    this.runtime.sessionAttachments?.launchFailed(agentId);
+  };
+
+  readonly refreshSession: PluginSessionsRuntime["refreshSession"] = async (agentId, options) => {
+    while (this.restarts.size > 0) await Promise.all(this.restarts);
+    return (await this.runtime.sessionAttachments?.refresh(agentId, options)) ?? { stale: false };
+  };
+
+  readonly sessionTools: PluginSessionsRuntime["sessionTools"] = (agentId) => {
+    return this.runtime.sessionAttachments?.tools(agentId) ?? [];
+  };
+
+  readonly closeSession: PluginSessionsRuntime["closeSession"] = (agentId) => {
+    this.runtime.sessionAttachments?.close(agentId);
+  };
+
+  readonly callTool: PluginSessionsRuntime["callTool"] = async (
     pluginId,
     pluginInstanceId,
     agent,
@@ -176,7 +211,7 @@ export class PluginService {
     input,
     signal,
   ) => {
-    if (!this.isToolPluginAvailable(pluginId, pluginInstanceId) || !this.runtime.callTool)
+    if (!this.runtime.isToolPluginAvailable?.(pluginId, pluginInstanceId) || !this.runtime.callTool)
       return { isError: true, text: `Plugin is not available: ${pluginId}` };
     return this.runtime.callTool(pluginId, pluginInstanceId, agent, name, input, signal);
   };
@@ -247,6 +282,17 @@ export class PluginService {
     return this.usageSources.listLegacyUsage();
   }
 
+  subscribeUsageReports(listener: (entry: UsageReportEntry) => void): () => void {
+    return this.usageSources.subscribe(listener);
+  }
+
+  /** Merges usage an agent observed into its account's report; see UsageSourceRegistry. */
+  observeUsage(agentId: string, observation: UsageObservation): void {
+    void this.usageSources.observeUsage(agentId, observation).catch((error) => {
+      this.logger.warn({ err: error, agentId }, "Failed to apply observed usage");
+    });
+  }
+
   subscribeProviderRegistrations(listener: () => void): () => void {
     this.providerListeners.add(listener);
     return () => this.providerListeners.delete(listener);
@@ -262,6 +308,7 @@ export class PluginService {
         await this.runtime.startBuiltinPlugin?.(plugin);
         await this.publishProviderRegistrations(plugin.id, plugin.directory);
         this.publishUsageSources(plugin.id);
+        this.publishTunnelProviders(plugin.id);
       } catch (error) {
         this.logger.error({ err: error, pluginId: plugin.id }, "Failed to start built-in plugin");
       }
@@ -513,8 +560,10 @@ export class PluginService {
         throw new Error("Plugins are globally disabled");
       }
       this.errors.delete(pluginId);
-      await this.stopPlugin(pluginId);
-      await this.startExplicit(pluginId, source.path);
+      await this.restart(async () => {
+        await this.stopPlugin(pluginId);
+        await this.startExplicit(pluginId, source.path);
+      });
       this.notify(pluginId);
       return this.requireItem(pluginId);
     });
@@ -661,10 +710,12 @@ export class PluginService {
     try {
       await this.publishProviderRegistrations(pluginId, sourcePath);
       this.publishUsageSources(pluginId);
+      this.publishTunnelProviders(pluginId);
     } catch (error) {
       try {
         this.removeProviderRegistrations(pluginId);
         this.removeUsageSources(pluginId);
+        await this.removeTunnelProviders(pluginId);
       } finally {
         await this.runtime.stopPluginById(pluginId);
       }
@@ -672,9 +723,10 @@ export class PluginService {
     }
   }
 
-  private stopPlugin(pluginId: string): Promise<boolean> {
+  private async stopPlugin(pluginId: string): Promise<boolean> {
     this.removeProviderRegistrations(pluginId);
     this.removeUsageSources(pluginId);
+    await this.removeTunnelProviders(pluginId);
     return this.runtime.stopPluginById(pluginId);
   }
 
@@ -690,7 +742,78 @@ export class PluginService {
       this.removeProviderRegistrations(pluginId);
     }
     for (const pluginId of this.usageSourceIdsByPlugin.keys()) this.removeUsageSources(pluginId);
+    await Promise.all(
+      [...this.tunnelProviderIdsByPlugin.keys()].map((pluginId) =>
+        this.removeTunnelProviders(pluginId),
+      ),
+    );
     await this.runtime.stopAll();
+  }
+
+  private buildTunnelProviders(pluginId: string): RegisteredTunnelProvider[] {
+    const metadata = this.runtime.getTunnelProviderRegistrations?.(pluginId) ?? [];
+    return metadata.map((provider) => {
+      const entry: RegisteredTunnelProvider = {
+        id: provider.id,
+        pluginId,
+        label: provider.label,
+        description: provider.description,
+        docsUrl: provider.docsUrl,
+        status: (options) => {
+          if (!this.runtime.getTunnelProviderStatus) {
+            throw new Error("Plugin runtime cannot query tunnel provider status");
+          }
+          return this.runtime.getTunnelProviderStatus(pluginId, provider.id, options);
+        },
+        open: (exposureId, target, callbacks) => {
+          if (!this.runtime.openTunnel) {
+            throw new Error("Plugin runtime cannot open tunnels");
+          }
+          return this.runtime.openTunnel(pluginId, provider.id, exposureId, target, callbacks);
+        },
+      };
+      return entry;
+    });
+  }
+
+  private publishTunnelProviders(pluginId: string): void {
+    if (!this.tunnelManager) return;
+    const providers = this.buildTunnelProviders(pluginId);
+    const registered: string[] = [];
+    try {
+      for (const provider of providers) {
+        this.tunnelManager.registerProvider(provider);
+        registered.push(provider.id);
+      }
+    } catch (error) {
+      for (const id of registered) {
+        void this.tunnelManager.unregisterProvider(id);
+      }
+      throw error;
+    }
+    if (registered.length > 0) {
+      this.tunnelProviderIdsByPlugin.set(pluginId, registered);
+    }
+  }
+
+  private async syncTunnelProviders(pluginId: string): Promise<void> {
+    if (!this.tunnelManager) return;
+    const providers = this.buildTunnelProviders(pluginId);
+    await this.tunnelManager.syncPluginProviders(pluginId, providers);
+    if (providers.length > 0) {
+      this.tunnelProviderIdsByPlugin.set(
+        pluginId,
+        providers.map((provider) => provider.id),
+      );
+    } else {
+      this.tunnelProviderIdsByPlugin.delete(pluginId);
+    }
+  }
+
+  private async removeTunnelProviders(pluginId: string): Promise<void> {
+    this.tunnelProviderIdsByPlugin.delete(pluginId);
+    if (!this.tunnelManager) return;
+    await this.tunnelManager.unregisterPlugin(pluginId);
   }
 
   private publishUsageSources(pluginId: string): void {
@@ -698,8 +821,11 @@ export class PluginService {
     const registered: string[] = [];
     try {
       for (const source of metadata) {
+        const isBuiltinProviderSource =
+          source.provider !== undefined && BUILTIN_PROVIDER_ID_SET.has(source.provider);
         if (
           source.provider &&
+          !isBuiltinProviderSource &&
           !this.runtime
             .getProviderRegistrations?.(pluginId)
             .some((provider) => provider.id === source.provider)
@@ -776,7 +902,9 @@ export class PluginService {
           description: provider.description,
           docsUrl: provider.docsUrl,
           command: provider.command,
+          launchWrap: provider.launchWrap,
           requiresConfiguration: provider.requiresConfiguration,
+          catalogRefresh: provider.catalogRefresh,
           status: provider.hasStatus
             ? (request) => {
                 if (!this.runtime.getProviderStatus)
@@ -857,6 +985,17 @@ export class PluginService {
     for (const listener of this.providerListeners) listener();
   }
 
+  private async restart(run: () => Promise<void>): Promise<void> {
+    const restart = run();
+    const settled = restart.catch(() => {});
+    this.restarts.add(settled);
+    try {
+      await restart;
+    } finally {
+      this.restarts.delete(settled);
+    }
+  }
+
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.lifecycle.then(operation, operation);
     this.lifecycle = result.then(
@@ -897,28 +1036,30 @@ export class PluginService {
     const shouldActivate =
       current.enabled !== false && this.configStore.get().pluginsEnabled === true;
     if (shouldActivate) {
-      if (isRunning) await this.stopPlugin(pluginId);
-      try {
-        await this.startExplicit(pluginId, candidate.directory);
-      } catch (error) {
-        let recoveryError: unknown;
+      await this.restart(async () => {
+        if (isRunning) await this.stopPlugin(pluginId);
         try {
-          this.errors.delete(pluginId);
-          if (isRunning && this.canPublish(pluginId))
-            await this.startExplicit(pluginId, source.path);
-        } catch (restoreError) {
-          recoveryError = restoreError;
-        } finally {
-          await managedSources.discard(candidate);
-          this.notify(pluginId);
+          await this.startExplicit(pluginId, candidate.directory);
+        } catch (error) {
+          let recoveryError: unknown;
+          try {
+            this.errors.delete(pluginId);
+            if (isRunning && this.canPublish(pluginId))
+              await this.startExplicit(pluginId, source.path);
+          } catch (restoreError) {
+            recoveryError = restoreError;
+          } finally {
+            await managedSources.discard(candidate);
+            this.notify(pluginId);
+          }
+          if (recoveryError)
+            throw new Error(
+              `Update failed: ${error instanceof Error ? error.message : String(error)}; restoring previous plugin also failed: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+              { cause: error },
+            );
+          throw error;
         }
-        if (recoveryError)
-          throw new Error(
-            `Update failed: ${error instanceof Error ? error.message : String(error)}; restoring previous plugin also failed: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
-            { cause: error },
-          );
-        throw error;
-      }
+      });
     }
     const activatedSource = this.configStore.get().plugins?.[pluginId];
     if (!activatedSource) {

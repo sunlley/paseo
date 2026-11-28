@@ -1,5 +1,9 @@
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { mapCustomMessageToToolCall } from "../custom-message.js";
+import {
+  MessageContentStream,
+  type AssistantMessageContentChunk,
+} from "../message-content-stream.js";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -95,6 +99,7 @@ import type {
 } from "./rpc-types.js";
 import {
   parseToolArgs,
+  withOmpToolIntent,
   parseToolResult,
   toolFailureMessage,
   isOmpToolFailure,
@@ -433,6 +438,7 @@ function buildResumeStartInput(input: {
     cwd: input.resumeConfig.cwd,
     protocolMode: "rpc-ui",
     env: input.launchContext?.env,
+    wrap: input.launchContext?.wrap,
     session: input.sessionFile,
     thinkingOptionId: normalizeOmpThinkingOption(input.resumeConfig.thinkingOptionId) ?? undefined,
     ...(input.launchMode.modeId ? { modeId: input.launchMode.modeId } : {}),
@@ -681,6 +687,7 @@ export class OmpAgentSession implements AgentSession {
   private readonly pendingClientMessages: Array<{ clientMessageId: string | null; text: string }> =
     [];
   private activeAssistantMessageId: string | null = null;
+  private readonly activeAssistantContent = new MessageContentStream();
   private activeTurnTerminalAssistantMessage: OmpAgentMessage | null = null;
   private activeTurnStarted = false;
   private outOfBandTurnStartAnnounced = false;
@@ -889,6 +896,7 @@ export class OmpAgentSession implements AgentSession {
     this.activeTurnId = turnId;
     this.turnMeter.begin(Date.now());
     this.activeAssistantMessageId = null;
+    this.activeAssistantContent.reset();
     this.activeTurnTerminalAssistantMessage = null;
     this.activeTurnStarted = false;
     this.outOfBandTurnStartAnnounced = false;
@@ -1263,7 +1271,14 @@ export class OmpAgentSession implements AgentSession {
     this.clearOmpTurnState();
   }
 
-  private resetActiveTurn({ terminalizeWork }: { terminalizeWork: boolean }): void {
+  private resetActiveTurn({
+    terminalizeWork,
+    turnId,
+  }: {
+    terminalizeWork: boolean;
+    turnId?: string;
+  }): void {
+    this.flushActiveAssistantContent(turnId ?? this.currentTurnIdForEvent());
     if (terminalizeWork) this.terminalizeActiveWork();
     this.activeTurnId = null;
     this.activeAssistantMessageId = null;
@@ -1603,6 +1618,10 @@ export class OmpAgentSession implements AgentSession {
   private handleExtensionUiRequest(
     event: Extract<OmpRuntimeEvent, { type: "extension_ui_request" }>,
   ): void {
+    if (event.method === "cancel") {
+      if (event.targetId) this.closeExtensionUiRequest(event.targetId);
+      return;
+    }
     const message = optionalString(event.message);
     if (event.method === "notify" && message) {
       this.emit({
@@ -1645,6 +1664,19 @@ export class OmpAgentSession implements AgentSession {
       type: "permission_requested",
       provider: this.provider,
       request,
+      turnId: this.currentTurnIdForEvent(),
+    });
+  }
+
+  /** OMP aborted or timed out a dialog: close its card without a reply OMP would reject. */
+  private closeExtensionUiRequest(requestId: string): void {
+    if (!this.pendingExtensionUiRequests.delete(requestId)) return;
+    this.questionUi.forget(requestId);
+    this.emit({
+      type: "permission_resolved",
+      provider: this.provider,
+      requestId,
+      resolution: { behavior: "deny", message: "OMP closed the question." },
       turnId: this.currentTurnIdForEvent(),
     });
   }
@@ -1876,13 +1908,15 @@ export class OmpAgentSession implements AgentSession {
     void this.hostTools?.close();
     this.usagePoller.stopTurn();
     if (!this.activeTurnId) {
+      this.flushActiveAssistantContent(undefined);
+      this.activeAssistantMessageId = null;
       this.terminalizeActiveWork();
       this.subagentIndex.clear(this.runtimeSession);
       this.emit({ type: "turn_failed", provider: this.provider, error });
       return;
     }
     const turnId = this.activeTurnId;
-    this.resetActiveTurn({ terminalizeWork: true });
+    this.resetActiveTurn({ terminalizeWork: true, turnId });
     this.subagentIndex.clear(this.runtimeSession);
     this.emit({
       type: "turn_failed",
@@ -1915,7 +1949,7 @@ export class OmpAgentSession implements AgentSession {
         }
         return;
       case "message_start":
-        this.handleMessageStart(event);
+        this.handleMessageStart(event, turnId);
         return;
       case "message_end":
         if (event.message.role === "user") {
@@ -1927,8 +1961,9 @@ export class OmpAgentSession implements AgentSession {
         this.handleMessageUpdate(event, turnId);
         return;
       case "tool_execution_start": {
+        this.flushActiveAssistantContent(turnId);
         this.turnMeter.toolStarted(event.toolCallId, Date.now());
-        const toolCall = parseToolArgs(event.toolName, event.args);
+        const toolCall = parseToolArgs(event.toolName, event.args, event.intent);
         this.activeToolCalls.set(event.toolCallId, toolCall);
         this.questionUi.start(event.toolName, event.args);
         this.emitToolCallEvent(event.toolCallId, toolCall, "running", null, null);
@@ -1967,6 +2002,7 @@ export class OmpAgentSession implements AgentSession {
         if (!terminalMessages) {
           return;
         }
+        this.flushActiveAssistantContent(turnId);
         // A state request is processed after OMP's RPC loop becomes promptable,
         // so do not advertise Paseo idle until it reports that transition.
         void this.completeTurnAfterProviderIdle(turnId, terminalMessages);
@@ -2029,32 +2065,49 @@ export class OmpAgentSession implements AgentSession {
     event: Extract<OmpAgentSessionEvent, { type: "message_update" }>,
     turnId: string | undefined,
   ): void {
-    if (event.message.role !== "assistant") {
+    if (event.message && event.message.role !== "assistant") {
       return;
     }
-    if (event.assistantMessageEvent.type === "text_delta") {
-      // Omp-compatible runtimes may emit updates without a preceding message_start.
-      this.activeAssistantMessageId ??= event.message.responseId || randomUUID();
-      this.emit({
-        type: "timeline",
-        provider: this.provider,
-        turnId,
-        item: {
-          type: "assistant_message",
-          text: event.assistantMessageEvent.delta ?? "",
-          messageId: this.activeAssistantMessageId,
-        },
-      });
-      return;
-    }
-    if (event.assistantMessageEvent.type === "thinking_delta") {
+    const message = event.message?.role === "assistant" ? event.message : undefined;
+    this.emitMessageContentChunks(
+      this.activeAssistantContent.update(event.assistantMessageEvent),
+      turnId,
+      message?.responseId,
+    );
+  }
+
+  private flushActiveAssistantContent(turnId: string | undefined, responseId?: string): void {
+    this.emitMessageContentChunks(this.activeAssistantContent.finish(), turnId, responseId);
+  }
+
+  private emitMessageContentChunks(
+    chunks: AssistantMessageContentChunk[],
+    turnId: string | undefined,
+    responseId?: string,
+  ): void {
+    for (const chunk of chunks) {
+      if (chunk.type === "text") {
+        // Omp-compatible runtimes may emit updates without a preceding message_start.
+        this.activeAssistantMessageId ??= responseId || randomUUID();
+        this.emit({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: {
+            type: "assistant_message",
+            text: chunk.text,
+            messageId: this.activeAssistantMessageId,
+          },
+        });
+        continue;
+      }
       this.emit({
         type: "timeline",
         provider: this.provider,
         turnId,
         item: {
           type: "reasoning",
-          text: event.assistantMessageEvent.delta ?? "",
+          text: chunk.text,
         },
       });
     }
@@ -2062,9 +2115,12 @@ export class OmpAgentSession implements AgentSession {
 
   private handleMessageStart(
     event: Extract<OmpAgentSessionEvent, { type: "message_start" }>,
+    turnId: string | undefined,
   ): void {
     if (event.message.role === "assistant") {
+      this.flushActiveAssistantContent(turnId);
       this.activeAssistantMessageId = event.message.responseId || null;
+      this.activeAssistantContent.reset();
     }
   }
 
@@ -2080,6 +2136,7 @@ export class OmpAgentSession implements AgentSession {
     turnId: string | undefined,
   ): void {
     if (event.message.role === "assistant") {
+      this.flushActiveAssistantContent(turnId, event.message.responseId);
       this.activeAssistantMessageId = null;
       this.questionUi.observeMessage(event.message);
       this.observeReply(event.message);
@@ -2205,7 +2262,7 @@ export class OmpAgentSession implements AgentSession {
       type: "timeline",
       provider: this.provider,
       turnId,
-      item,
+      item: withOmpToolIntent(item, toolCall),
     });
     return true;
   }
@@ -2356,15 +2413,18 @@ export class OmpAgentClient implements AgentClient {
     runtimeSession: OmpRuntimeSession,
     catalog: PaseoToolCatalog | undefined,
     config: AgentSessionConfig,
-    launchEnv?: NodeJS.ProcessEnv,
+    launch: Pick<OmpStartSessionInput, "env" | "wrap">,
   ): Promise<OmpHostToolRouter | undefined> {
     if (!catalog && !config.mcpServers) {
       return;
     }
-    const bridge = await OmpMcpBridge.connect(config.mcpServers, config.cwd, this.logger, {
-      ...process.env,
-      ...this.runtimeSettings?.env,
-      ...launchEnv,
+    // Paseo starts stdio MCP servers for OMP, so they run behind the agent's wrap as OMP does.
+    const bridge = await OmpMcpBridge.connect({
+      servers: config.mcpServers,
+      cwd: config.cwd,
+      logger: this.logger,
+      env: { ...process.env, ...this.runtimeSettings?.env, ...launch.env },
+      wrap: launch.wrap,
     });
     const router = new OmpHostToolRouter({ runtimeSession, catalog, bridge, logger: this.logger });
     try {
@@ -2407,6 +2467,7 @@ export class OmpAgentClient implements AgentClient {
         ...(config.pluginAppendSystemPrompt ?? []),
       ),
       env: launchContext?.env,
+      wrap: launchContext?.wrap,
     };
     const runtimeSession = await this.resolveRuntime(config.providerOptions).startSession(
       startInput,
@@ -2417,7 +2478,7 @@ export class OmpAgentClient implements AgentClient {
         runtimeSession,
         launchContext?.paseoTools,
         config,
-        startInput.env,
+        startInput,
       );
       const initialState = await this.restoreFastMode(
         runtimeSession,
@@ -2487,7 +2548,7 @@ export class OmpAgentClient implements AgentClient {
         runtimeSession,
         launchContext?.paseoTools,
         resumeConfig.config,
-        startInput.env,
+        startInput,
       );
       const resumedState = await this.applyResumeModel(runtimeSession, resumeConfig.model);
       const config = {
@@ -2566,7 +2627,7 @@ export class OmpAgentClient implements AgentClient {
           next,
           launchContext?.paseoTools,
           config,
-          startInput.env,
+          startInput,
         );
         const state = await next.getState();
         await this.restoreFastMode(next, config, state);

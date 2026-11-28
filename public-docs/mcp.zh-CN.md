@@ -96,14 +96,17 @@ Paseo Agent 默认会收到完成、错误和权限通知；设置 `notifyOnFini
 
 ### 工作区 {#workspaces}
 
-| 工具                | 功能                                                                                                                                                                                                                                             |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `create_workspace`  | 创建本地工作区或使用 worktree 隔离的工作区。worktree 可以从某个分支分出、检出一个分支或一个 PR。`background: true` 会把它从默认列表和侧边栏中隐藏，同时保留历史记录和按 ID 访问。省略时继承调用方 Agent 工作区的设置；没有调用方时默认为 false。 |
-| `list_workspaces`   | 列出活动的工作区及其目录和隔离方式。使用 `includeBackground: true` 可以包含后台工作区。                                                                                                                                                          |
-| `rename_workspace`  | 修改当前或指定工作区在界面上显示的名称。                                                                                                                                                                                                         |
-| `archive_workspace` | 归档工作区及其拥有的会话。                                                                                                                                                                                                                       |
+| 工具                | 功能                                                                                                                                                                                                                                                                      |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create_workspace`  | 创建本地工作区或使用 worktree 隔离的工作区，可选附带初始 `metadata`。worktree 可以从某个分支分出、检出一个分支或一个 PR。`background: true` 会把它从默认列表和侧边栏中隐藏，同时保留历史记录和按 ID 访问。省略时继承调用方 Agent 工作区的设置；没有调用方时默认为 false。 |
+| `list_workspaces`   | 列出活动的工作区及其目录、隔离方式和 `metadata`。使用 `includeBackground: true` 可以包含后台工作区。                                                                                                                                                                      |
+| `update_workspace`  | 更新当前或指定工作区的 `title`（传 `null` 清除）和/或结构化 `metadata`（顶层键替换，传 `null` 删除该键）。                                                                                                                                                                |
+| `rename_workspace`  | 修改当前或指定工作区在界面上显示的名称。                                                                                                                                                                                                                                  |
+| `archive_workspace` | 归档工作区及其拥有的会话。                                                                                                                                                                                                                                                |
 
 对于 worktree 隔离，`create_workspace` 接受与应用中相同的常用选择：从某个基础分支分出、检出一个已有分支，或检出一个 Pull Request。worktree 仍然是工作区生命周期的实现细节。
+
+工作区的 `metadata` 在字符串键下存储任意 JSON 值，并在 daemon 重启后保留。常见键包括 `issues`（issue URL 或引用数组）以及 `body`、`summary` 或 `notes`，也可以添加工作流所需的任意自定义键。在 `update_workspace` 中将某个键设为 `null` 即可移除它。
 
 ### 工作区脚本 {#workspace-scripts}
 
@@ -147,7 +150,7 @@ Paseo Agent 默认会收到完成、错误和权限通知；设置 `notifyOnFini
 
 MCP heartbeat 是临时的：只能创建或删除。要修改一个 heartbeat，请删除它并创建一个替代的。暂停、恢复、更新、查看、日志和单次运行只适用于新建 Agent 的定时任务。
 
-默认情况下，新建 Agent 的定时任务每次运行结束时都会归档其工作区。`create_schedule` 和 `update_schedule` 不提供 **Archive on finish**（`archiveOnFinish`）；要让之后的运行工作区保持活跃，请[在应用中修改该选项](/docs/schedules#keep-run-workspaces)。
+默认情况下，新建 Agent 的定时任务每次运行结束时都会归档其工作区。向 `create_schedule` 或 `update_schedule` 传入 `archiveOnFinish: false`，即可[让之后的运行工作区保持活跃](/docs/schedules#keep-run-workspaces)；它对应应用中的 **Archive on finish** 选项。
 
 ### Agent 配置 {#agent-profiles}
 

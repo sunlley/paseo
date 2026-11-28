@@ -13,15 +13,19 @@ nav: 参考
 本地插件是安装到某个 Paseo daemon 中的目录来源。插件可以贡献：
 
 - 为 Paseo 客户端添加 React Native 界面，以及侧边栏顶部和底部项；
+- 替换侧边栏列表的[侧边栏视图](/docs/plugins/sidebar-views)，以及工作区行上的[徽标](#workspace-row-badge-items)；
 - 作为工作区标签页打开的工作区面板和 Agent 面板；
 - 用于查看或编辑匹配文件的[文件面板](#file-panels)；
 - Command Center 中的全局、工作区和 Agent 操作；
-- 消息 Composer 中的斜杠命令；
+- 消息 Composer 中的斜杠命令、[控件](#composer-items)、胶囊和可搜索的外部资源；
+- 工作区标题栏中的[按钮](#header-buttons)，以及新建工作区界面上的[字段](#new-workspace-items)；
+- [设置界面](#settings-screens)，以及 **设置 → 外观** 中的浅色和深色主题；
 - 经过转换的、以及由 daemon 推送的 Agent 时间线行；
-- **设置 → 外观** 中的浅色和深色主题；
-- 在 daemon 旁运行、经过 schema 校验的 RPC 处理函数；
-- 通过 TypeScript SDK 执行的普通 Paseo 操作；
-- 消息 Composer 中可搜索的外部资源。
+- 面向活跃客户端或移动推送的[通知](#notifications)以及自定义点击处理函数；
+- 在 daemon 旁运行、经过 schema 校验的 RPC 处理函数和事件流；
+- 修改或观察工作区、worktree 和 Agent 操作的[钩子](/docs/plugins/hooks)；
+- [Agent Provider](/docs/plugins/providers)、[用量来源](#usage-sources)和 [worktree 管理器](#worktree-managers)；
+- 通过 TypeScript SDK 执行的普通 Paseo 操作。
 
 插件代码是受信任的，没有沙盒。客户端界面在 Paseo 应用中运行。后端贡献在一个子进程中运行，可以访问 daemon 所在的机器，包括它的文件、进程、凭据和网络。
 
@@ -349,7 +353,7 @@ openBrowser({ url, workspaceId: remoteWorkspaceId, serverId: remoteServerId });
 
 ### 服务端运行时 {#server-runtime}
 
-Paseo 为服务端代码提供 `@getpaseo/plugin`、`@getpaseo/plugin/server`、`@getpaseo/plugin/server/provider`、`@getpaseo/plugin/server/acp` 和 `zod`。后端贡献在 daemon 子进程中运行，可以通过 Node 访问宿主机器。请把文件系统、进程、凭据以及其他本机工作放在 `server/` 下。没有 `index.server.ts` 的插件不会启动子进程。
+Paseo 为服务端代码提供 `@getpaseo/plugin`、`@getpaseo/plugin/server`、`@getpaseo/plugin/server/provider`、`@getpaseo/plugin/server/acp`、`@getpaseo/plugin/server/usage` 和 `zod`。后端贡献在 daemon 子进程中运行，可以通过 Node 访问宿主机器。请把文件系统、进程、凭据以及其他本机工作放在 `server/` 下。没有 `index.server.ts` 的插件不会启动子进程。
 
 ### Provider {#providers}
 
@@ -508,17 +512,17 @@ type UsageProblem =
 
 内置的会话路由：
 
-| 来源         | 会话                                           | 登录存储                                                                     |
-| ------------ | ---------------------------------------------- | ---------------------------------------------------------------------------- |
-| Claude       | `claude`                                       | `CLAUDE_CONFIG_DIR` 或默认位置；在 macOS 上，该目录对应的钥匙串条目优先      |
-| Claude       | 使用 `anthropic/…` 模型的 `pi`、`omp`          | 该运行环境的 Anthropic 登录存储                                              |
-| Codex        | `codex`                                        | `CODEX_HOME/auth.json` 或默认位置                                            |
-| Codex        | 使用 `openai/…` 模型的 `pi`、`opencode`、`omp` | 该运行环境的 OpenAI 登录存储                                                 |
-| Cursor       | `cursor`                                       | 该会话的 `XDG_CONFIG_HOME`、`APPDATA` 或主目录下 cursor-agent 的 `auth.json` |
-| Muse         | `muse`                                         | 该会话自己的 Muse 启动配置                                                   |
-| 其他内置来源 | 任意                                           | 无会话发现                                                                   |
+| 来源         | 会话                                           | 登录存储                                                                                                                                              |
+| ------------ | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude       | `claude`                                       | `CLAUDE_CONFIG_DIR` 或默认位置；在 macOS 上，该目录对应的钥匙串条目优先                                                                               |
+| Claude       | 使用 `anthropic/…` 模型的 `pi`、`omp`          | 该运行环境的 Anthropic 登录存储                                                                                                                       |
+| Codex        | `codex`                                        | `CODEX_HOME/auth.json` 或默认位置                                                                                                                     |
+| Codex        | 使用 `openai/…` 模型的 `pi`、`opencode`、`omp` | 该运行环境的 OpenAI 登录存储                                                                                                                          |
+| Cursor       | `cursor`                                       | 该会话的 `XDG_CONFIG_HOME`、`APPDATA` 或主目录下 cursor-agent 的 `auth.json`；在 macOS 上默认读取钥匙串，除非设置了 `AGENT_CLI_CREDENTIAL_STORE=file` |
+| Muse         | `muse`                                         | 该会话自己的 Muse 启动配置                                                                                                                            |
+| 其他内置来源 | 任意                                           | 无会话发现                                                                                                                                            |
 
-Claude 会排除 Bedrock、Vertex 以及使用其他 `ANTHROPIC_BASE_URL` 的会话。Codex 会排除设置了 `OPENAI_BASE_URL` 的会话。Cursor 会排除通过 `CURSOR_API_KEY` 或 `CURSOR_AUTH_TOKEN` 验证的会话，以及在 macOS 上把登录保存在钥匙串中的会话（除非设置了 `AGENT_CLI_CREDENTIAL_STORE=file`，否则这是默认行为）。
+Claude 会排除 Bedrock、Vertex 以及使用其他 `ANTHROPIC_BASE_URL` 的会话。Codex 会排除设置了 `OPENAI_BASE_URL` 的会话。Cursor 会排除通过 `CURSOR_API_KEY` 或 `CURSOR_AUTH_TOKEN` 验证的会话。
 
 使用稳定的账号键：由 `[A-Za-z0-9._-]` 中的字符组成，长度为 1–128。它标识被计量配额的账号或组织，并且在 token 轮换后保持不变。不要把凭据或原始邮箱地址用作键。对于敏感的稳定身份，请使用 `hashAccountKey()`；当账号元数据不可用时，使用存储位置标识。标签可以为账号命名，但不会成为账号的身份。
 
@@ -657,6 +661,83 @@ export default function contribute(server: PluginServerContext) {
 
 完整插件见 [worktrunk 示例](https://github.com/getpaseo/paseo/tree/main/plugin-examples/worktrunk)。
 
+## 隧道 Provider {#tunnel-providers}
+
+**需要 Paseo 0.18**。在服务端入口 `index.server.ts` 中调用 `server.registerTunnelProvider()` 注册隧道 Provider，可将本地 HTTP `host:port` 目标转为公网 HTTPS URL。注册返回一个清理函数，调用后会注销该 Provider 并关闭其所有活动的暴露。
+
+```ts
+import {
+  execCommand,
+  spawnProcess,
+  terminateProcess,
+  type PluginServerContext,
+} from "@getpaseo/plugin/server";
+
+export default function contribute(server: PluginServerContext) {
+  return server.registerTunnelProvider({
+    id: "custom-tunnel",
+    label: "Custom Tunnel",
+    description: "Expose local HTTP targets through a custom tunnel binary.",
+    docsUrl: "https://example.com/docs/custom-tunnel",
+    async status({ signal }) {
+      try {
+        const { stdout } = await execCommand("custom-tunnel", ["--version"], {
+          signal,
+          timeout: 5_000,
+        });
+        return { status: "available", detail: stdout.trim() || undefined };
+      } catch {
+        return {
+          status: "unavailable",
+          reason: "custom-tunnel is not installed or not on PATH.",
+          installUrl: "https://example.com/install",
+          fixHint: "Install custom-tunnel and make sure that it is on PATH.",
+        };
+      }
+    },
+    async open(target, { report, signal }) {
+      report({ type: "connecting" });
+      const child = spawnProcess("custom-tunnel", ["http", `${target.host}:${target.port}`], {
+        stdio: "pipe",
+      });
+      signal.addEventListener(
+        "abort",
+        () => {
+          void terminateProcess(child, "SIGTERM").catch(() => undefined);
+        },
+        { once: true },
+      );
+      let ready = false;
+      child.stderr.on("data", (chunk) => {
+        if (ready || signal.aborted) return;
+        const match = /https:\/\/[a-z0-9.-]+/i.exec(String(chunk));
+        if (!match) return;
+        ready = true;
+        report({ type: "ready", url: match[0], stability: "ephemeral" });
+      });
+      await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", () => resolve());
+      });
+      report({ type: "closed", reason: signal.aborted ? "aborted" : undefined });
+    },
+  });
+}
+```
+
+- `id` 必须匹配 `/^[a-z][a-z0-9._-]*$/`，且在已安装插件和内置插件之间唯一。
+- `status({ paseo, signal })` 检查该 Provider 能否在此主机上打开隧道。返回 `{ status: "available", detail? }` 或 `{ status: "unavailable", reason, installUrl?, fixHint? }`。
+- `open(target, { paseo, signal, report })` 负责一个暴露，直到 `signal` 中止或隧道关闭。`target` 包含 `{ id, host, port, label?, slug? }`。
+- 暴露状态变化时调用 `report(event)`：
+  - `{ type: "connecting", detail? }`
+  - `{ type: "ready", url, stability?: "ephemeral" | "stable", detail? }`
+  - `{ type: "reconnecting", reason? }`
+  - `{ type: "error", message, recoverable?: boolean }`
+  - `{ type: "closed", reason? }`
+- 隧道保持连接期间，`open()` 应保持挂起。`signal` 中止时，停止子进程或移除远程规则，报告 `{ type: "closed" }`，然后返回。如果 `open()` 抛出错误，或在报告 `ready` 之前退出，Paseo 会将该暴露标记为失败并将其完整移除。
+
+完整插件见 [tunnel-provider 示例](https://github.com/getpaseo/paseo/tree/main/plugin-examples/tunnel-provider)。
+
 ## 入口与清理 {#entry-point-and-cleanup}
 
 每个存在的入口都默认导出一个贡献函数，并返回清理函数。客户端入口接收 `PluginClientContext`；服务端入口接收 `PluginServerContext`。客户端注册方法返回幂等的移除函数，但标题栏按钮和 Composer 标签除外，它们返回 `{ update, remove }` 句柄。入口的清理函数会在 Paseo 移除剩余的注册之前运行。
@@ -672,6 +753,78 @@ export default function contribute(client: PluginClientContext) {
 ```
 
 清理函数可以是异步的。请释放插件创建的计时器、监听器、套接字和其他资源。重新加载、停用和移除会销毁受影响的插件安装。停止服务端插件还会关闭它的 daemon 会话并停止其子进程。客户端安装遵循[主机与生命周期](#hosts-and-lifecycle)中的规则，包括在暂时断开连接时保留安装。
+
+## 通知 {#notifications}
+
+**需要 Paseo 0.18**。在服务端钩子、RPC 处理函数或后台监听器中调用 `server.notifications.send()`，可在用户当前活跃的桌面/Web 客户端上发送系统通知，或在用户离开时发送移动端推送通知。
+
+```ts
+// index.server.ts
+import type { PluginServerContext } from "@getpaseo/plugin/server";
+
+export default function contribute(server: PluginServerContext) {
+  const unhook = server.addHook("agent.turn.after", async ({ agent, outcome }) => {
+    if (outcome.kind !== "failed" || agent.background) return;
+    await server.notifications.send({
+      title: agent.title ?? "Agent failed",
+      body: outcome.error.message,
+      key: `agent-failed:${agent.id}`,
+      open: { type: "agent", agentId: agent.id },
+      data: { agentId: agent.id },
+    });
+  });
+  return () => unhook();
+}
+```
+
+### 发送输入与限制 {#send-input-and-limits}
+
+| 字段    | 必填 | 限制 / 行为                                                                                     |
+| ------- | ---- | ----------------------------------------------------------------------------------------------- |
+| `title` | 是   | 去除首尾空白后的非空字符串；超过 160 个字符时自动截断。                                         |
+| `body`  | 是   | 去除首尾空白的字符串；超过 500 个字符时自动截断。                                               |
+| `key`   | 否   | 去除首尾空白的字符串，1–128 个字符。同一插件在 60 秒内发送相同 `key` 会返回 `deduplicated`。    |
+| `open`  | 否   | 声明式点击目标（ID 最多 256 个字符，序列化后不超过 1,024 UTF-8 字节），在未由处理函数处理时用。 |
+| `data`  | 否   | 序列化后不超过 1,024 UTF-8 字节的纯 JSON 对象，点击通知时传递给 `client.onNotificationOpen`。   |
+
+声明式 `open` 目标无需客户端入口：
+
+- `{ type: "agent", agentId: string }` 打开并聚焦该 Agent。若当前活跃可见客户端已聚焦在该 Agent 上，Paseo 会抑制该通知。
+- `{ type: "workspace", workspaceId: string }` 打开该工作区。
+- `{ type: "screen", screenId: string, params?: Record<string, string> }` 携带 URL 参数打开插件界面。
+
+`server.notifications.send()` 会解析为以下结果之一：
+
+- `{ status: "sent", notificationId: string }`：daemon 已受理并进入投递流程（即使某台设备静音了该通知）。
+- `{ status: "deduplicated" }`：`key` 与当前插件在过去 60 秒内发送的通知重复。
+- `{ status: "rate_limited" }`：当前插件超出了单插件令牌桶限制（突发容量 10，每 6 秒补充 1 个）。
+
+字段非法、`title` 为空，或 `open`/`data` 超过 1,024 UTF-8 字节会使返回的 Promise 被拒绝。用户可以在 **设置 → 通知** 中关闭全部插件通知或静音单个插件。
+
+### 在客户端处理通知点击 {#handle-notification-taps-on-the-client}
+
+如需根据 `data` 自定义点击跳转逻辑，请在 `index.client.tsx` 中注册 `client.onNotificationOpen(handler)`：
+
+```tsx
+// index.client.tsx
+import type { PluginClientContext } from "@getpaseo/plugin/client";
+
+export default function contribute(client: PluginClientContext) {
+  const unsub = client.onNotificationOpen(({ event, openScreen, navigation }) => {
+    if (typeof event.data?.agentId === "string") {
+      navigation.openAgent({ agentId: event.data.agentId, focusHost: true });
+    } else {
+      openScreen({
+        screenId: "alert",
+        params: { notificationId: event.notificationId },
+      });
+    }
+  });
+  return () => unsub();
+}
+```
+
+处理函数接收 `PluginCommandCapabilities`（`paseo`、`rpc`、`openScreen`、`composers`、`openSettings`）、`navigation.openAgent`、`navigation.openWorkspace` 以及 `event: { type: "opened", notificationId, data }`。注册 `onNotificationOpen` 后，该处理函数会接管此插件的所有通知点击。通过通知点击冷启动应用时，Paseo 会等待目标主机的插件目录加载完成后再调用你的处理函数；若插件未注册处理函数、所有已注册处理函数均抛出错误，或目录未能在时限内加载完成，Paseo 会回退到通知的声明式 `open` 目标。完整示例见 `plugin-examples/notifications`。
 
 ## 生命周期钩子 {#lifecycle-hooks}
 
@@ -1552,6 +1705,8 @@ const [state, setState] = useTabState(tab, schema, { view: "preview" });
 | `statusEnteredAt`    | ISO 时间戳或 `null`                                               |
 | `archivingAt`        | ISO 时间戳或 `null`                                               |
 | `diffStat`           | `{ additions: number; deletions: number } \| null`                |
+| `parentWorkspace`    | `WorkspaceRef \| null`                                            |
+| `metadata`           | `Readonly<Record<string, JsonValue>>`                             |
 
 Agent 快照字段：
 
@@ -1575,6 +1730,7 @@ Agent 快照字段：
 | `attentionReason`   | `"finished" \| "error" \| "permission" \| null`                |
 | `parentAgentId`     | `string \| null`                                               |
 | `labels`            | `Record<string, string>`                                       |
+| `metadata`          | `Readonly<Record<string, JsonValue>>`                          |
 
 `backgroundWork.count` 是 Agent 在回合结束后仍在运行的 shell 和监视器数量，没有时为 `0`。Agent 可能处于 `idle` 且 `attentionReason: "finished"`，同时这些工作仍在运行，因此请按插件的需要组合这些字段：
 
@@ -1613,13 +1769,13 @@ export default function contribute(client: PluginClientContext) {
 
 `addFilePanel` 接收一个 `PluginFilePanelContribution`，并返回一个幂等的清理函数。客户端入口被卸载时，Paseo 也会移除该注册。
 
-| 字段        | 必填 | 含义                                                                 |
-| ----------- | ---- | -------------------------------------------------------------------- |
-| `id`        | 是   | 插件内唯一的 ID，匹配 `^[a-z][a-z0-9-]*$`。                          |
-| `title`     | 是   | 显示在选择器、**打开方式…** 菜单和 **设置 > 文件** 中的非空标签。    |
-| `icon`      | 是   | Lucide 名称、`{ svg }` 或组件。参见[图标](#icons)。                  |
-| `files`     | 是   | `{ extensions: readonly string[]; filenames?: readonly string[] }`。 |
-| `Component` | 是   | 接收 `PluginFilePanelProps` 的组件。                                 |
+| 字段        | 必填 | 含义                                                                           |
+| ----------- | ---- | ------------------------------------------------------------------------------ |
+| `id`        | 是   | 插件内唯一的 ID，匹配 `^[a-z][a-z0-9-]*$`。                                    |
+| `title`     | 是   | 显示在选择器、**打开方式…** 菜单和 **设置 → 聊天与面板 → 文件** 中的非空标签。 |
+| `icon`      | 是   | Lucide 名称、`{ svg }` 或组件。参见[图标](#icons)。                            |
+| `files`     | 是   | `{ extensions: readonly string[]; filenames?: readonly string[] }`。           |
+| `Component` | 是   | 接收 `PluginFilePanelProps` 的组件。                                           |
 
 扩展名不带前导点，匹配时不区分大小写。文件名按完整的 basename 匹配，区分大小写。选择器不包含路径、glob 或通配符。只按文件名选择时，请使用 `extensions: []`。至少需要一个扩展名或文件名。
 
@@ -1700,7 +1856,7 @@ hook 的重新读取会采用磁盘上的版本，因此下一次写入会覆盖
 
 **不再询问** 会在此设备上为该扩展名记住这个选择。当某个候选面板匹配了确切的文件名时，该选择改为应用于那个 basename。不可用的关联在该主机上会被忽略，并为安装了其面板的主机保留。
 
-用户有三种方式选择面板：第一次打开时的选择器、标签页菜单中的 **打开方式…**，以及 **设置 > 文件**。打开方式会切换当前标签页，并且对于这个标签页优先于记住的关联，直到标签页被重新定向；其中的 **始终用于** 会记住当前显示的面板。从链接或搜索结果在某一行打开文件时，标签页会切换到它的内置面板，并在源代码视图中显示该行。没有候选面板的文件显示 **二进制预览不可用**；二进制文件没有源代码面板。
+用户有三种方式选择面板：第一次打开时的选择器、标签页菜单中的 **打开方式…**，以及 **设置 → 聊天与面板 → 文件**（有插件注册文件面板时显示）。打开方式会切换当前标签页，并且对于这个标签页优先于记住的关联，直到标签页被重新定向；其中的 **始终用于** 会记住当前显示的面板。从链接或搜索结果在某一行打开文件时，标签页会切换到它的内置面板，并在源代码视图中显示该行。没有候选面板的文件显示 **二进制预览不可用**；二进制文件没有源代码面板。
 
 ### DocumentFrame {#documentframe}
 

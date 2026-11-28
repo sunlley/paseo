@@ -2,6 +2,8 @@ import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-clien
 
 export type FinishObservationResult = WaitForFinishResult & {
   reason?: "was canceled" | "host unreachable" | "host removed";
+  /** The idle child's background work changed without a turn ending. */
+  workChanged?: true;
 };
 
 /** Coalesces duplicate checkpoints and retains one terminal result while delivery is pending. */
@@ -11,6 +13,8 @@ export function createObservationBuffer(signal: AbortSignal) {
   const resolvedBeforeInitial = new Set<string>();
   let initialPending = true;
   let terminal: FinishObservationResult | undefined;
+  /** A turn end arrived from the stream; the initial wait can only repeat it. */
+  let ended = false;
   let failure: unknown;
   let wake: (() => void) | undefined;
   const abort = () => {
@@ -23,7 +27,10 @@ export function createObservationBuffer(signal: AbortSignal) {
     if (result.status === "permission") {
       for (const request of result.final?.pendingPermissions ?? [])
         if (!delivered.has(request.id)) permissions.set(request.id, result);
-    } else terminal = result;
+    } else if (!result.workChanged || !terminal || terminal.workChanged) {
+      terminal = result;
+      if (!result.workChanged) ended = true;
+    }
     wake?.();
   }
   return {
@@ -36,7 +43,7 @@ export function createObservationBuffer(signal: AbortSignal) {
         if (pendingPermissions.length)
           push({ ...result, final: { ...result.final, pendingPermissions } });
       } else if (
-        !terminal &&
+        !ended &&
         result.final?.status !== "running" &&
         result.final?.status !== "initializing"
       )

@@ -61,6 +61,11 @@ the chat and its replica cache would keep only the end of the reply. A recovery 
 running catch-up starts after whatever that catch-up applied, because the app applies a forward page
 row by row and an older cursor repeats rows.
 
+A live row whose epoch differs from the local cursor is a rewind or replacement this client never
+saw as an invalidation, not a stale row. The app recovers like a gap: it asks `after` its own
+cursor, and the daemon answers that stale epoch with a reset tail. Dropping the rows instead would
+leave the chat on pre-rewind history while the new epoch streams.
+
 Initialization timeouts guard lack of catch-up progress, not the full multi-page sync. A successful page that queues the next `after` page refreshes the watchdog.
 
 Opening or resuming an agent fetches the latest available turns with a soft target of 40
@@ -202,10 +207,23 @@ owner wraps cached preparation, network catch-up, accepted timeline application,
 behind one interface. React supplies transport and projection operations without selecting a cache
 path or issuing a separate persistence notification.
 
-Active-agent list reconciliation does not own transcript lifetime. An archived agent's fresh
-history response can arrive before the active-list response that omits it. Clearing history there
-would discard accepted rows while the viewed owner still considers them synchronized. Entity
-deletion clears the transcript; list membership changes do not.
+The viewed-timeline owner also owns how long a transcript stays in memory. An active agent's
+transcript stays resident while its chat is hidden, so switching back to it needs no fetch. An
+archived agent's transcript stays resident only while its chat is shown, for example when it is
+opened from History. When an agent is archived, or the active list drops it because its workspace
+was archived, the owner releases the transcript unless the chat is shown. It also releases the
+transcript when the chat stops being shown. A released chat leaves the opened chats. When it is
+shown again, it reads the replica cache and catches up again. A history page, live event, or cache
+read that arrives after the release is dropped.
+
+The active-list reconciliation does not release transcripts itself. An archived agent's fresh
+history response can arrive before the active-list response that omits it, while the chat is
+open in History. Clearing history there would discard rows the user is reading.
+
+An agent counts as archived when the active list omits it, when its row has an archive timestamp,
+or when the workspace list omits its workspace. The workspace check matters because a workspace
+archive can complete while one of its agents keeps a row with no archive timestamp. Until a list
+first hydrates, it marks no agent as archived. Deleting the agent clears the transcript.
 
 Removing the host from the registry is the destructive boundary: it stops the runtime and clears the
 session and host-scoped setup state together.
@@ -312,19 +330,35 @@ that starts or accepts them. Received messages retain sender attribution, while 
 notifications remain visible events. Collapse, timing and locally mounted history share
 these boundaries.
 
-Agent-message XML belongs to the daemon's `agent/agent-messages` boundary. Prompt delivery encodes
+Agent-message markup belongs to the daemon's `agent/agent-messages` boundary. Prompt delivery encodes
 provenance; acceptance, provider echoes, import, and replay share its projection. The delivery ID is
 also the projected call ID, so a provider echo cannot create a second row. Sender IDs are opaque and
 do not imply local ownership or authorization. Capture the sender title at delivery: archived or
 removed senders must remain understandable without a live directory lookup.
 
-The optional `agentMessage` payload carries event, sender, and delivered text. Shared client
-presentation (`protocol/paseo-tool-presentation`) owns its heading and expanded details, next to the
-labels for every Paseo MCP tool. The daemon
-must not construct UI labels or prepend sender labels to the semantic message body. The existing
-`tool_call` / `plain_text` envelope is a compatibility adapter: older clients still parse the row and
-expand its body. New clients use the typed payload, never infer the event from a tool name or parse
-XML. Stream reduction and disk-cache serialization preserve the payload without rendering it.
+Each delivered message keeps its text first and ends with a `<paseo-message … length="N"/>` marker.
+Text at character 0 stays the sender's, so a provider still reads a slash command there, and bodies
+are never escaped. `length` bounds the text before the marker, so marker syntax inside a body cannot
+split it, and a batch splits back into rows by reading markers from the end. A person's prompt gets a
+marker only when it shares a provider turn with other deliveries or contains `<paseo-message` or
+`<paseo-system`. Transcripts written before markers open with a `<paseo-system>` envelope; the
+projection still reads those (`COMPAT(leadingPaseoSystemEnvelope)`).
+
+The daemon decides whether a delivery is a message or a tool call, and clients render what it sends:
+
+- A person's text is a `user_message`.
+- A peer message is an `agent_message` tool call whose `agentMessage` carries sender and text. The
+  wire has no sender on `user_message`, so clients present it as a "Sent by" bubble.
+- Lifecycle notifications (`agent_finished`, `agent_errored`, `agent_needs_permission`,
+  `agent_closed`), schedule fires (`heartbeat`), and change-request updates
+  are plain tool calls. `plain_text` detail carries the sender in `label`, the body in `text`, and
+  the icon. Clients render the heading from the tool name, so no notification event reaches them.
+
+`isTimelineTurnTrigger` (`packages/protocol/src/timeline-turn.ts`) lists the delivered tool names that
+start a turn. Add a name there when the daemon projects a new delivery. Rows that older daemons stored
+with notification `agentMessage` metadata are rewritten to the plain call at presentation
+(`COMPAT(agentNotificationMetadata)`). Stream reduction and disk-cache serialization preserve the
+payload without rendering it.
 
 The compatibility boundary for older daemons is snapshot normalization: running/idle status becomes an
 anonymous active turn or idle state once, and downstream code consumes the same activity shape. The app

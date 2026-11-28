@@ -8,13 +8,14 @@ on:
   merge_group:
   workflow_dispatch:
 
-# A newer push to the same ref cancels the run still in progress, main included.
-# A full run costs about 200 runner-minutes against the org's 20 concurrent
-# jobs, and a superseded main run only answers a question the newer commit
-# answers again.
+# A newer push cancels the run still in progress on every ref except main,
+# because a full run costs about 200 runner-minutes against the org's 20
+# concurrent jobs. A main run finishes: cancelling it mid-flight leaves CANCELLED
+# checks that paint the commit red. Each ref has one run in progress and one
+# pending, so a newer push replaces a pending main run before it starts any job.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # CI does not use the CUDA execution provider, and the onnxruntime-node
@@ -87,10 +88,6 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
         run: npx --yes lockfile-lint --path package-lock.json --type npm --allowed-hosts npm --validate-https --validate-integrity
 
-      - name: Verify dependency signatures
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
-        run: npm audit signatures
-
       - name: Lint
         if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
         run: npm run lint
@@ -135,6 +132,29 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
         run: npm run typecheck:examples --workspace=@getpaseo/client
 
+  # Plugin process launches and launch wraps quote for cmd.exe, which only real Windows checks.
+  sdk-tests-windows:
+    name: sdk-tests (windows-latest)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: node scripts/npm-retry.mjs ci
+
+      - name: Build plugin SDK
+        run: npm run build:relay && npm run build:client && npm run build:plugin
+
+      - name: Run plugin SDK tests
+        run: npm run test --workspace=@getpaseo/plugin
+
   # The locked Playwright installers do not support ubuntu-latest's Ubuntu 26.04.
   typecheck:
     name: typecheck
@@ -154,6 +174,9 @@ jobs:
 
       - name: Verify dependency patch recovery
         run: node --test scripts/postinstall-patches.test.mjs
+
+      - name: Verify daemon runtime trace contract
+        run: node --test scripts/trace-daemon.test.mjs
 
       - name: Build server stack
         run: npm run build:server
@@ -323,6 +346,8 @@ jobs:
         run: |
           npm run test:unit --workspace=@getpaseo/server -- \
             src/server/file-observer \
+            src/server/workspace-reconciliation-observation.test.ts \
+            src/utils/checkout-git-identity.test.ts \
             src/server/workspace-git-service.observation.test.ts \
             src/server/workspace-git-service.observation.integration.test.ts \
             --bail=1

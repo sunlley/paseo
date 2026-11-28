@@ -1,9 +1,11 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import path from "node:path";
 import {
+  expectTimelinePromptVisible,
   holdOlderHistoryPages,
   scrollTimelineRowIntoView,
   userScrollsTimelineToHistoryStart,
+  waitForTimelineGeometryToSettle,
 } from "../support/helpers/timeline-pagination";
 import { getActiveTabTestId } from "../support/helpers/launcher";
 import type { Page, Locator } from "@playwright/test";
@@ -11,8 +13,12 @@ import { test, expect } from "../support/fixtures";
 import { expectComposerVisible } from "../support/helpers/composer";
 import { withDirectoryPlugin } from "../support/helpers/plugin-timeline";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
+import { getE2EDaemonPort } from "../support/helpers/daemon-port";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 test.use({
+  e2eInjectPaseoTools: true,
   e2eDaemonConfig: {
     version: 1,
     agents: {
@@ -288,6 +294,89 @@ test("received messages show their sender and open that agent", async ({ page })
   }
 });
 
+/** Calls a Paseo MCP tool as `callerAgentId`, the way that agent's provider would. */
+async function callPaseoToolAs(
+  callerAgentId: string,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const mcp = new Client({ name: "turn-collapse-e2e", version: "1" });
+  await mcp.connect(
+    new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${getE2EDaemonPort()}/mcp/agents?callerAgentId=${callerAgentId}`),
+    ),
+  );
+  try {
+    const response = await mcp.callTool({ name, arguments: args });
+    expect(response, name).not.toMatchObject({ isError: true });
+    return response.structuredContent as Record<string, unknown>;
+  } finally {
+    await mcp.close();
+  }
+}
+
+test("a delegated child reports each turn end as a compact tool call until its own delegate is done", async ({
+  page,
+}, testInfo) => {
+  const frames: string[] = [];
+  page.on("websocket", (socket) => {
+    socket.on("framereceived", ({ payload }) => {
+      if (typeof payload === "string") frames.push(payload);
+    });
+  });
+  const childNoticeFrames = () => frames.filter((frame) => frame.includes('"label":"Child"'));
+  const parent = await seedMockAgentWorkspace({ repoPrefix: "child-notices-", title: "Lead" });
+  try {
+    await openAgentRoute(page, parent);
+    await expectComposerVisible(page);
+    const child = await callPaseoToolAs(parent.agentId, "create_agent", {
+      workspaceId: parent.workspaceId,
+      title: "Child",
+      provider: "mock/e2e-fast-stream",
+      settings: { modeId: "load-test" },
+      initialPrompt: "Delegate the slow part",
+    });
+    const childId = String(child.agentId);
+    // The child's own delegate outlives the child's first turn.
+    const grandchild = await callPaseoToolAs(childId, "create_agent", {
+      workspaceId: parent.workspaceId,
+      title: "Grandchild",
+      provider: "mock/ten-second-stream",
+      settings: { modeId: "load-test" },
+      initialPrompt: "Take your time",
+    });
+    const notices = page.getByRole("button", { name: /^Agent .*Child/ });
+    const finished = page.getByRole("button", { name: /^Agent finished.*Child/ });
+
+    // The child ended its turn while waiting on its delegate: the parent hears it now.
+    await expect(finished).toHaveCount(1, { timeout: 30_000 });
+    const delegate = await parent.client.waitForAgentUpsert(String(grandchild.agentId), () => true);
+    expect(delegate.status, "the delegate must still be running").toBe("running");
+    expect(
+      childNoticeFrames().some((frame) => frame.includes("It still has agents it is waiting on.")),
+    ).toBe(true);
+
+    // The delegate reports to the child, and the child's settled turn reaches the parent.
+    await expect(finished).toHaveCount(2, { timeout: 60_000 });
+    await expect(notices).toHaveCount(2);
+    await expect(page.getByText(/still working/i)).toHaveCount(0);
+    await expect(page.getByText(/Sent by/)).toHaveCount(0);
+    await expect(page.getByText(/<agent-response>/)).toHaveCount(0);
+    await finished.last().scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath("child-notices.png") });
+    // Notification events stay on the daemon: clients get only plain tool calls.
+    expect(frames.filter((frame) => frame.includes('"agentMessage"'))).toEqual([]);
+    expect(childNoticeFrames().some((frame) => frame.includes('"name":"agent_finished"'))).toBe(
+      true,
+    );
+    expect(childNoticeFrames().filter((frame) => /"name":"agent_(?!finished)/.test(frame))).toEqual(
+      [],
+    );
+  } finally {
+    await parent.cleanup();
+  }
+});
+
 test("long sender attribution stays on one line in compact chat", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.addInitScript(() =>
@@ -491,6 +580,39 @@ async function seedWholeTurnHistory() {
   return agent;
 }
 
+/** Read every command across the scroll window, without requiring offscreen rows to mount. */
+async function expectExpandedCommandsReadable(page: Page, count: number) {
+  const timeline = page.getByTestId("agent-chat-scroll");
+  const commands = new Set<number>();
+  await timeline.hover();
+  await waitForTimelineGeometryToSettle(page);
+  for (let step = 0; step < count && commands.size < count; step += 1) {
+    const labels = await timeline
+      .getByRole("button", { name: /echo stress-\d+/ })
+      .allTextContents();
+    for (const label of labels) {
+      const command = /echo stress-(\d+)/.exec(label);
+      if (command) commands.add(Number(command[1]));
+    }
+    if (commands.size < count) {
+      await page.mouse.wheel(0, 300);
+      await waitForTimelineGeometryToSettle(page);
+    }
+  }
+  expect([...commands].sort((a, b) => a - b)).toEqual(
+    Array.from({ length: count }, (_, index) => index),
+  );
+}
+
+async function returnToExpandedSummary(page: Page, summary: Locator) {
+  await page.getByTestId("agent-chat-scroll").hover();
+  for (let step = 0; step < 120 && !(await summary.isVisible()); step += 1) {
+    await page.mouse.wheel(0, -300);
+    await waitForTimelineGeometryToSettle(page);
+  }
+  await scrollTimelineRowIntoView(page, summary);
+}
+
 async function expectInitialFillIsConcealed(page: Page) {
   await expect(page.getByTestId("agent-initial-fill")).toBeVisible();
   await expect(page.getByTestId("agent-chat-scroll")).toHaveCSS("opacity", "0");
@@ -564,14 +686,14 @@ test("loads complete long turns and preserves expansion while revealing older hi
     ).toBeVisible();
     await expect.poll(() => rowsBetweenLatestSummaryAndReply(page)).toBe(0);
     await latest.click();
-    await expect.poll(() => rowsBetweenLatestSummaryAndReply(page)).toBe(120);
+    await expectExpandedCommandsReadable(page, 120);
     await userScrollsTimelineToHistoryStart(page);
     await history.expectRequestedPages(3);
     history.releasePage(3);
-    await page.getByTestId("scroll-to-bottom-button").click();
-    await expect.poll(() => rowsBetweenLatestSummaryAndReply(page)).toBe(120);
+    await expectTimelinePromptVisible(page, "Short 4: emit 1 coalesced agent stream updates");
+    await expectExpandedCommandsReadable(page, 120);
     history.expectNoRepeatedEntries();
-    await scrollTimelineRowIntoView(page, latest);
+    await returnToExpandedSummary(page, latest);
     await latest.click();
     await expect.poll(() => rowsBetweenLatestSummaryAndReply(page)).toBe(0);
   } finally {

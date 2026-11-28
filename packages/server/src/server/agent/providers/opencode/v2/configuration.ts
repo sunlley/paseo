@@ -1,15 +1,12 @@
 import type { SessionInfo, PermissionRuleset } from "@opencode/client";
 import type { V2Api } from "./api.js";
 
-import type {
-  AgentLaunchContext,
-  AgentOptionControl,
-  AgentSessionConfig,
-} from "../../../agent-sdk-types.js";
+import type { AgentOptionControl, AgentSessionConfig } from "../../../agent-sdk-types.js";
 
 import { OpenCodeProviderOptionsSchema, buildOpenCodePermissionRules } from "../options.js";
 
 import { modelRef } from "./mapping.js";
+import { openCodeMcpToolName } from "./session-mcp.js";
 
 export const controls: AgentOptionControl[] = [
   { type: "toggle", key: "auto_accept", label: "Auto-accept" },
@@ -21,7 +18,7 @@ export function permissionRules(config: AgentSessionConfig): PermissionRuleset {
       undefined,
     ) ?? [];
   const grants: PermissionRuleset = (config.toolPolicy?.preapproved ?? []).map((grant) => ({
-    action: `${grant.server.replace(/[^a-zA-Z0-9_-]/g, "_")}_${grant.tool.replace(/[^a-zA-Z0-9_-]/g, "_")}`,
+    action: openCodeMcpToolName(grant.server, grant.tool),
     resource: "*",
     effect: "allow",
   }));
@@ -52,25 +49,12 @@ export async function applyResumeOverrides(
     info.agent = overrides.modeId;
   }
   if (overrides?.model || overrides?.thinkingOptionId !== undefined) {
-    const model = overrides.model
-      ? modelRef(overrides.model, overrides.thinkingOptionId ?? info.model?.variant)
-      : info.model && { ...info.model, variant: overrides.thinkingOptionId };
-    if (!model) throw new Error("Select an OpenCode model before changing its variant");
+    const id = overrides.model ?? (info.model && `${info.model.providerID}/${info.model.id}`);
+    if (!id) throw new Error("Select an OpenCode model before changing its variant");
+    const variant =
+      overrides.thinkingOptionId === undefined ? info.model?.variant : overrides.thinkingOptionId;
+    const model = modelRef(id, variant);
     await client.session.switchModel({ sessionID: info.id, model });
     info.model = model;
   }
-}
-
-// Agent identity env is applied per session through `session.environment`, so
-// it must not force a dedicated server. Custom MCP is location-scoped, and any
-// other env key belongs to the process, so both need isolation. Mirrors the v1
-// adapter's `requiresDedicatedOpenCodeServer`.
-const V2_SESSION_ENV_KEYS = new Set(["PASEO_AGENT_ID", "PASEO_AGENT_CWD", "PASEO_WORKSPACE_ID"]);
-
-export function requiresDedicatedV2Server(
-  config: AgentSessionConfig,
-  launch?: AgentLaunchContext,
-): boolean {
-  if (Object.keys(config.mcpServers ?? {}).length > 0) return true;
-  return Object.keys(launch?.env ?? {}).some((key) => !V2_SESSION_ENV_KEYS.has(key));
 }
