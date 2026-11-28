@@ -103,6 +103,15 @@ The `worktree-include` built-in copies gitignored files selected by
 [`.worktreeinclude`](../public-docs/worktrees.md#copy-local-files-with-worktreeinclude)
 before setup and agents, through `worktree.create.after`.
 
+The `work-items` built-in gives interactive agents `create_work_item`, `update_work_item` and
+`list_work_items`, plus an appended instruction to open one before a feature or bug fix. Items
+live in `$PASEO_HOME/plugin-data/work-items.json`: a host settings document cannot hold them,
+because server code can only read settings, not save them. Progress mirrors the creating agent's
+todo timeline items and a merged workspace PR completes the item; both watches start lazily from
+hooks and tools, the only places a built-in receives a `PaseoApi`. The client shows one composer
+pill per agent on Electron only (`window.paseoDesktop`). It auto-approves permission requests for
+its own three tools through `agent.permission.before`; they only write the plugin's data file.
+
 Desktop packaging ships the entire built-in plugin directory as an external resource,
 including declarations. The external esbuild compiler cannot read Electron's `app.asar`
 filesystem, and packaging dependencies excludes `.d.ts` files needed for import validation.
